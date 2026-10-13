@@ -13,7 +13,10 @@ RUN apt-get update \
 	&& npm install -g pnpm@${PNPM_VERSION}
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-RUN pnpm install --frozen-lockfile
+# generous fetch timeout — heavy native packages (~100MB+) on first build
+# (note: pnpm 12 removed --fetch-retries/--fetch-retry-*-timeout CLI flags)
+RUN pnpm install --frozen-lockfile --reporter=append-only \
+	--fetch-timeout 600000
 
 COPY . .
 RUN pnpm build
