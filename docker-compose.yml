@@ -4,15 +4,15 @@ services:
     image: voice-to-categories:latest
     restart: unless-stopped
     ports:
-      # host:container — change the host side (or PORT below) if 3000 is taken
-      - '${APP_PORT:-3000}:3000'
+      # host:container — change the host side (or PORT below) if 3011 is taken
+      - "${APP_PORT:-3011}:3011"
     environment:
-      PORT: 3000
+      PORT: 3011
       DATABASE_PATH: /app/data/app.db
       AUDIO_DIR: /app/data/audio
       # SvelteKit adapter-node needs ORIGIN for correct URLs/csrf.
-      # Precedence: ORIGIN → Coolify's FQDN → http://localhost:3000
-      ORIGIN: ${ORIGIN:-${COOLIFY_FQDN:-http://localhost:3000}}
+      # Precedence: ORIGIN → Coolify's FQDN → http://localhost:3011
+      ORIGIN: ${ORIGIN:-${COOLIFY_FQDN:-http://localhost:3011}}
     env_file:
       # .env is gitignored and usually absent on the deploy server (e.g. Coolify);
       # secrets should be set as environment variables in the platform UI instead.

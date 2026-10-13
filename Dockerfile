@@ -24,7 +24,7 @@ RUN pnpm build
 # ---------- runtime ----------
 FROM node:${NODE_VERSION}-slim AS runtime
 ENV NODE_ENV=production \
-	PORT=3000 \
+	PORT=3011 \
 	DATABASE_PATH=/app/data/app.db \
 	AUDIO_DIR=/app/data/audio
 WORKDIR /app
@@ -38,5 +38,5 @@ RUN mkdir -p /app/data \
 
 USER node
 VOLUME /app/data
-EXPOSE 3000
+EXPOSE 3011
 CMD ["node", "start.js"]
