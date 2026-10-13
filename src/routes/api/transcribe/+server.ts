@@ -21,10 +21,16 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	const file = form.get('audio') as File;
 	const audio = Buffer.from(await file.arrayBuffer());
 
-	const text = await getOpenRouter().transcribe({
-		audio,
-		mimeType: meta.mimeType,
-		languageHint: null
-	});
-	return json({ transcript: text });
+	try {
+		const text = await getOpenRouter().transcribe({
+			audio,
+			mimeType: meta.mimeType,
+			languageHint: null
+		});
+		return json({ transcript: text });
+	}
+	catch (ex) {
+		console.error('Transcribe error:', ex);
+		throw error(500, 'Failed to transcribe audio');
+	}
 };

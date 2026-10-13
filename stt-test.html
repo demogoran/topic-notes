@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Live STT — Whisper &amp; Parakeet in the browser</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115; color: #e6e6e6;
+    max-width: 900px; margin: 2rem auto; padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; }
+  .card {
+    background: #1a1e26; border: 1px solid #2a3040; border-radius: 10px;
+    padding: 1rem 1.2rem; margin-bottom: 1rem;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; margin-bottom: 0.8rem; }
+  label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; color: #9aa4b8; }
+  select {
+    background: #232a37; color: #e6e6e6; border: 1px solid #34405a;
+    border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.9rem;
+  }
+  select:disabled { opacity: 0.45; }
+  button {
+    background: #2f6df6; color: #fff; border: 0; border-radius: 6px;
+    padding: 0.55rem 1.2rem; font-size: 0.95rem; cursor: pointer;
+  }
+  button.secondary { background: #333b4c; }
+  button:disabled { background: #333b4c; color: #777; cursor: not-allowed; }
+  #status { font-size: 0.85rem; color: #9aa4b8; margin-top: 0.7rem; min-height: 1.2em; }
+  #status.err { color: #ff7b72; }
+  .meter { height: 8px; background: #232a37; border-radius: 4px; overflow: hidden; margin-top: 0.6rem; }
+  .meter > div { height: 100%; width: 0; background: #3fb950; transition: width 60ms linear; }
+  .bar { height: 6px; background: #232a37; border-radius: 3px; overflow: hidden; margin-top: 0.5rem; }
+  .bar > div { height: 100%; width: 0; background: #2f6df6; transition: width 120ms linear; }
+  #transcript {
+    white-space: pre-wrap; min-height: 8rem; max-height: 24rem; overflow-y: auto;
+    font-size: 1.05rem;
+  }
+  #interim { font-size: 0.85rem; color: #7d8799; margin-top: 0.5rem; min-height: 1.2em; font-style: italic; }
+  .rec-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #d33; margin-right: 6px; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0.2; } }
+  p.hint { font-size: 0.8rem; color: #7d8799; }
+  code { background: #232a37; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<h1>🎙️ Live speech-to-text (Whisper &amp; Parakeet, fully in-browser)</h1>
+
+<div class="card">
+  <div class="row">
+    <label>Engine
+      <select id="engine">
+        <option value="whisper" selected>Whisper — Transformers.js</option>
+        <option value="parakeet">Parakeet TDT v3 — onnxruntime-web</option>
+      </select>
+    </label>
+    <label>Model
+      <select id="model"></select>
+    </label>
+    <label>Language <select id="lang" disabled>
+      <option value="">Auto-detect</option>
+      <option value="en">English</option>
+      <option value="uk">Ukrainian (українська)</option>
+    </select></label>
+    <label>Task <select id="task" disabled>
+      <option value="transcribe">Transcribe</option>
+      <option value="translate">Translate → English</option>
+    </select></label>
+    <label>&nbsp; <button id="startBtn" disabled>Loading…</button></label>
+    <label>&nbsp; <button id="clearBtn" class="secondary">Clear transcript</button></label>
+  </div>
+
+  <div id="status">Initialising…</div>
+  <div class="bar"><div id="dlBar"></div></div>
+  <div class="meter"><div id="level"></div></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:1rem;margin:0 0 .5rem">Transcript</h2>
+  <div id="transcript"></div>
+  <div id="interim"></div>
+</div>
+
+<p class="hint">
+  <b>Whisper</b>: force EN/UK, can translate UA→EN. <b>Parakeet TDT 0.6B v3</b> (NVIDIA): 21 European
+  languages incl. Ukrainian &amp; Russian, auto-detected, outputs punctuation + capitalization,
+  non-autoregressive (much faster than Whisper). WebGPU is used when available, otherwise WASM.
+  Parakeet worker adapted from mrfakename's <i>parakeet-redux-webgpu</i> demo.
+</p>
+
+<!-- ============================================================= -->
+<!-- Parakeet inference worker (module worker, loaded from a blob). -->
+<!-- TDT greedy decode adapted from:                               -->
+<!-- https://huggingface.co/spaces/mrfakename/parakeet-redux-webgpu -->
+<!-- ============================================================= -->
+<script type="text/plain" id="parakeet-worker-src">
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
+
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
+ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 4) : 1;
+ort.env.logLevel = "error";
+
+const CACHE_NAME = "parakeet-stt-page-v1";
+const SR = 16000;
+const BLANK = 8192;
+const VOCAB = 8193;
+const DURATIONS = [0, 1, 2, 3, 4];
+const MAX_SYMBOLS = 10;
+
+let state = { pre: null, enc: null, dec: null, vocab: null, encDevice: null };
+const post = (type, data = {}) => self.postMessage({ type, ...data });
+
+// ---------- downloads (with Cache API + parallel ranged fetch) ----------
+async function treeSizes(repo) {
+  const r = await fetch(`https://huggingface.co/api/models/${repo}/tree/main?recursive=true`);
+  if (!r.ok) throw new Error(`tree ${repo}: ${r.status}`);
+  const out = {};
+  for (const f of await r.json()) out[f.path] = f.lfs?.size ?? f.size;
+  return out;
+}
+
+async function readInto(resp, buf, offset, onBytes) {
+  const reader = resp.body.getReader();
+  let pos = offset;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf.set(value, pos);
+    pos += value.length;
+    onBytes(value.length);
+  }
+  return pos - offset;
+}
+
+async function getFile(url, size, onBytes) {
+  let cache = null;
+  try { cache = await caches.open(CACHE_NAME); } catch {}
+  if (cache) {
+    const hit = await cache.match(url);
+    if (hit) {
+      const ab = await hit.arrayBuffer();
+      if (!size || ab.byteLength === size) { onBytes(ab.byteLength, true); return new Uint8Array(ab); }
+    }
+  }
+  let buf;
+  const CH = 8 << 20, CONC = 8;
+  if (size && size > 2 * CH) {
+    buf = new Uint8Array(size);
+    const ranges = [];
+    for (let s = 0; s < size; s += CH) ranges.push([s, Math.min(size, s + CH) - 1]);
+    let next = 0;
+    const worker = async () => {
+      while (next < ranges.length) {
+        const [s, e] = ranges[next++];
+        for (let attempt = 0; ; attempt++) {
+          let got = 0;
+          try {
+            const r = await fetch(url, { headers: { Range: `bytes=${s}-${e}` } });
+            if (r.status !== 206) throw new Error(`range ${r.status}`);
+            const n = await readInto(r, buf, s, (k) => { got += k; onBytes(k); });
+            if (n !== e - s + 1) throw new Error("short read");
+            break;
+          } catch (err) {
+            onBytes(-got);
+            if (attempt >= 3) throw err;
+            await new Promise((res) => setTimeout(res, 500 * (attempt + 1)));
+          }
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: CONC }, worker));
+  } else {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url}: ${r.status}`);
+    const len = size || +r.headers.get("content-length") || 0;
+    if (len) { buf = new Uint8Array(len); await readInto(r, buf, 0, onBytes); }
+    else { const ab = await r.arrayBuffer(); onBytes(ab.byteLength); buf = new Uint8Array(ab); }
+  }
+  if (cache) {
+    try { await cache.put(url, new Response(buf, { headers: { "content-type": "application/octet-stream" } })); } catch {}
+  }
+  return buf;
+}
+
+// ---------- model ----------
+async function load(cfg) {
+  post("status", { text: "Fetching model files…" });
+  for (const s of [state.pre, state.enc, state.dec]) { try { await s?.release(); } catch {} }
+  state = {};
+  const sizes = await treeSizes(cfg.repo).catch(() => ({}));
+  const names = Object.values(cfg.files);
+  const total = names.reduce((a, n) => a + (sizes[n] || 0), 0);
+  let loaded = 0, lastPost = 0;
+  const onBytes = (n) => {
+    loaded += n;
+    const now = performance.now();
+    if (now - lastPost > 80) { lastPost = now; post("progress", { loaded, total }); }
+  };
+  const base = `https://huggingface.co/${cfg.repo}/resolve/main/`;
+  const bufs = await Promise.all(names.map((n) => getFile(base + n, sizes[n], onBytes)));
+  post("progress", { loaded: total || loaded, total: total || loaded });
+
+  post("status", { text: "Compiling model…" });
+  const vocab = [];
+  for (const line of new TextDecoder().decode(bufs[3]).split("\n")) {
+    if (!line) continue;
+    const i = line.lastIndexOf(" ");
+    vocab[+line.slice(i + 1)] = line.slice(0, i);
+  }
+  const wasmOpts = { executionProviders: ["wasm"], graphOptimizationLevel: "all" };
+  const pre = await ort.InferenceSession.create(bufs[0], wasmOpts);
+  const dec = await ort.InferenceSession.create(bufs[2], wasmOpts);
+  let enc, encDevice = "wasm";
+  if (navigator.gpu) {
+    try {
+      enc = await ort.InferenceSession.create(bufs[1], { executionProviders: ["webgpu"], graphOptimizationLevel: "all" });
+      encDevice = "webgpu";
+    } catch (e) {
+      console.warn("WebGPU session failed, falling back to WASM", e);
+    }
+  }
+  if (!enc) enc = await ort.InferenceSession.create(bufs[1], wasmOpts);
+  state = { pre, enc, dec, vocab, encDevice };
+
+  post("status", { text: "Warming up…" });
+  await transcribePcm(new Float32Array(SR));
+  post("loaded", { device: encDevice });
+}
+
+// ---------- inference ----------
+async function encode(pcm) {
+  const wav = new ort.Tensor("float32", pcm, [1, pcm.length]);
+  const wl = new ort.Tensor("int64", BigInt64Array.from([BigInt(pcm.length)]), [1]);
+  const pf = await state.pre.run({ waveforms: wav, waveforms_lens: wl });
+  const feats = pf[state.pre.outputNames[0]];
+  const flen = pf[state.pre.outputNames[1]];
+  const eo = await state.enc.run({ audio_signal: feats, length: flen });
+  const out = eo[state.enc.outputNames[0]];
+  const olen = Number(eo[state.enc.outputNames[1]].data[0]);
+  const [, D, T] = out.dims;
+  const src = out.data; // [1, D, T]
+  const frames = Math.min(olen, T);
+  const enc = new Float32Array(frames * D);
+  for (let d = 0; d < D; d++) {
+    const row = d * T;
+    for (let t = 0; t < frames; t++) enc[t * D + d] = src[row + t];
+  }
+  feats.dispose?.(); out.dispose?.();
+  return { enc, frames, D };
+}
+
+async function greedy({ enc, frames, D }) {
+  const dec = state.dec;
+  const zeros = () => new ort.Tensor("float32", new Float32Array(2 * 640), [2, 1, 640]);
+  let s1 = zeros(), s2 = zeros();
+  let last = BLANK, t = 0, steps = MAX_SYMBOLS * frames;
+  const tokens = [];
+  const tl = new ort.Tensor("int32", Int32Array.from([1]), [1]);
+  const fetches = ["outputs", "output_states_1", "output_states_2"];
+  while (t < frames && steps > 0) {
+    const feeds = {
+      encoder_outputs: new ort.Tensor("float32", enc.subarray(t * D, (t + 1) * D), [1, D, 1]),
+      targets: new ort.Tensor("int32", Int32Array.from([last]), [1, 1]),
+      target_length: tl,
+      input_states_1: s1,
+      input_states_2: s2,
+    };
+    const o = await dec.run(feeds, fetches);
+    const lg = o.outputs.data;
+    let tok = 0, best = -Infinity;
+    for (let i = 0; i < VOCAB; i++) if (lg[i] > best) { best = lg[i]; tok = i; }
+    let di = 0, bd = -Infinity;
+    for (let i = 0; i < DURATIONS.length; i++) if (lg[VOCAB + i] > bd) { bd = lg[VOCAB + i]; di = i; }
+    let du = DURATIONS[di];
+    if (tok === BLANK && du === 0) du = 1;
+    tokens.push(tok);
+    t += du;
+    if (tok !== BLANK) { last = tok; s1 = o.output_states_1; s2 = o.output_states_2; }
+    steps--;
+  }
+  return tokens;
+}
+
+const SKIP = new Set(["<unk>", "<pad>", "<blk>"]);
+function decodeText(ids) {
+  let s = "";
+  for (const i of ids) { const p = state.vocab[i]; if (p !== undefined && !SKIP.has(p)) s += p; }
+  return s.replace(/▁/g, " ").trim();
+}
+
+async function transcribePcm(pcm) {
+  const t0 = performance.now();
+  if (pcm.length < 400) return { text: "", ms: 0 };
+  const encoded = await encode(pcm);
+  const tokens = await greedy(encoded);
+  return {
+    text: decodeText(tokens),
+    ms: performance.now() - t0,
+    audioSec: pcm.length / SR,
+  };
+}
+
+let busy = Promise.resolve();
+self.onmessage = (ev) => {
+  const msg = ev.data;
+  busy = busy.then(async () => {
+    try {
+      if (msg.type === "load") {
+        await load(msg.cfg);
+      } else if (msg.type === "transcribe") {
+        if (!state.enc) throw new Error("Model not loaded");
+        const r = await transcribePcm(msg.pcm);
+        post("result", { id: msg.id, ...r, device: state.encDevice });
+      }
+    } catch (e) {
+      console.error(e);
+      post("error", { id: msg.id, message: String(e?.message || e) });
+    }
+  });
+};
+</script>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const startBtn = $('startBtn'), clearBtn = $('clearBtn');
+const statusEl = $('status'), dlBar = $('dlBar'), levelEl = $('level');
+const transcriptEl = $('transcript'), interimEl = $('interim');
+const engineSel = $('engine'), modelSel = $('model'), langSel = $('lang'), taskSel = $('task');
+
+const MODEL_OPTIONS = {
+  whisper: [
+    ['onnx-community/whisper-tiny',  'whisper-tiny (~43 MB) — fastest, ok for EN'],
+    ['onnx-community/whisper-base',  'whisper-base (~78 MB) — balanced'],
+    ['onnx-community/whisper-small', 'whisper-small (~250 MB) — best Whisper for UA'],
+  ],
+  parakeet: [
+    ['mrfakename/parakeet-ultra-ONNX|encoder-model.q4.onnx',
+      'parakeet-tdt-0.6b-v3 q4 (~470 MB) — ★ best for EN/UA'],
+    ['mrfakename/parakeet-ultra-ONNX|encoder-model.q8.onnx',
+      'parakeet-tdt-0.6b-v3 q8 (~740 MB) — higher precision'],
+  ],
+};
+
+function refreshModelOptions() {
+  const engine = engineSel.value;
+  modelSel.innerHTML = '';
+  const isWhisper = engine === 'whisper';
+  langSel.disabled = !isWhisper;
+  taskSel.disabled = !isWhisper;
+  MODEL_OPTIONS[engine].forEach(([v, label], i) => {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = label;
+    // default: whisper-base / parakeet q4
+    o.selected = (isWhisper && v.endsWith('base')) || (!isWhisper && i === 0);
+    modelSel.appendChild(o);
+  });
+}
+
+// ============================ engines ============================
+let engine = 'whisper';
+let transcriber = null;             // whisper pipeline (Transformers.js)
+let usedDevice = 'wasm';
+let pkWorker = null;                // parakeet worker (onnxruntime-web)
+let pkReady = false;
+let pkJobs = new Map();
+let pkJobId = 0;
+
+function setStatus(msg, isErr = false) {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('err', isErr);
+}
+
+// ---- whisper (Transformers.js) ----
+async function loadWhisper() {
+  const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3');
+  const modelId = modelSel.value;
+  const progress_callback = (p) => {
+    if (p.status === 'progress' && p.total) {
+      dlBar.style.width = `${Math.round((p.loaded / p.total) * 100)}%`;
+      setStatus(`Downloading ${p.file} … ${Math.round(p.progress)}%`);
+    }
+  };
+  if (navigator.gpu) {
+    try {
+      transcriber = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'webgpu',
+        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
+        progress_callback,
+      });
+      usedDevice = 'webgpu';
+    } catch (e) {
+      console.warn('WebGPU failed, falling back to WASM:', e);
+    }
+  }
+  if (!transcriber) {
+    transcriber = await pipeline('automatic-speech-recognition', modelId, {
+      device: 'wasm', dtype: 'q8', progress_callback,
+    });
+    usedDevice = 'wasm';
+  }
+}
+
+// ---- parakeet (onnxruntime-web in a module worker) ----
+function loadParakeet() {
+  return new Promise((resolve, reject) => {
+    const [repo, encFile] = modelSel.value.split('|');
+    const src = $('parakeet-worker-src').textContent;
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    pkWorker = new Worker(url, { type: 'module' });
+    pkReady = false;
+    pkWorker.onmessage = (ev) => {
+      const m = ev.data;
+      if (m.type === 'status') setStatus(m.text);
+      else if (m.type === 'progress') {
+        const mb = (b) => (b / 1e6).toFixed(0);
+        dlBar.style.width = m.total ? `${Math.round((m.loaded / m.total) * 100)}%` : '0';
+        setStatus(`Downloading… ${mb(m.loaded)} / ${mb(m.total) || '?'} MB`);
+      } else if (m.type === 'loaded') {
+        pkReady = true;
+        usedDevice = m.device;
+        resolve();
+      } else if (m.type === 'result') {
+        const j = pkJobs.get(m.id);
+        if (j) { pkJobs.delete(m.id); j.resolve(m.text || ''); }
+      } else if (m.type === 'error') {
+        const j = pkJobs.get(m.id);
+        if (j) { pkJobs.delete(m.id); j.reject(new Error(m.message)); }
+        else if (!pkReady) reject(new Error(m.message));
+      }
+    };
+    pkWorker.onerror = (e) => reject(new Error(e.message || 'worker error'));
+    pkWorker.postMessage({
+      type: 'load',
+      cfg: {
+        repo,
+        files: {
+          pre: 'preprocessor.onnx',
+          enc: encFile,
+          dec: 'decoder_joint-model.int8.onnx',
+          vocab: 'vocab.txt',
+        },
+      },
+    });
+  });
+}
+
+function transcribeSegment(samples) {
+  if (engine === 'whisper') {
+    const opts = { task: taskSel.value };
+    if (langSel.value) opts.language = langSel.value;
+    return transcriber(samples, opts).then((out) => out.text || '');
+  }
+  return new Promise((resolve, reject) => {
+    const id = ++pkJobId;
+    pkJobs.set(id, { resolve, reject });
+    pkWorker.postMessage({ type: 'transcribe', id, pcm: samples }, [samples.buffer]);
+  });
+}
+
+async function loadEngine() {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Loading…';
+  dlBar.style.width = '0';
+  if (recording) await stop();
+
+  // tear down previous engine
+  if (engine === 'whisper') transcriber = null;
+  if (pkWorker) { pkWorker.terminate(); pkWorker = null; pkReady = false; pkJobs.clear(); }
+  engine = engineSel.value;
+
+  setStatus('Loading model…');
+  try {
+    if (engine === 'whisper') await loadWhisper();
+    else await loadParakeet();
+    dlBar.style.width = '0';
+    setStatus(`Model ready (engine: ${engine}, device: ${usedDevice}). Press Start and speak.`);
+  } catch (e) {
+    setStatus('Failed to load model: ' + e.message, true);
+    return;
+  }
+  startBtn.textContent = '▶ Start listening';
+  startBtn.disabled = false;
+}
+
+// ============================ audio ============================
+const TARGET_SR = 16000;
+let audioCtx = null, stream = null, workletNode = null, sourceNode = null;
+let recording = false;
+let pendingFrames = [];
+let pendingSamples = 0;
+let noiseFloor = 0.003;
+let lastVoiceAt = 0;
+let segHasVoice = false;
+
+const SILENCE_MS = 700;
+const MIN_SEG_SAMPLES = TARGET_SR * 0.5;
+const MAX_SEG_SAMPLES = TARGET_SR * 12;
+const PRE_ROLL_SAMPLES = TARGET_SR * 0.35; // context kept between segments
+const SILENCE_KEEP = TARGET_SR * 2;        // max speech-less audio to retain
+
+const workletCode = `
+class PCMCollector extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor('pcm-collector', PCMCollector);
+`;
+const workletURL = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+
+function rms(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  return Math.sqrt(s / buf.length);
+}
+
+function toTargetSR(input, fromRate) {
+  if (fromRate === TARGET_SR) return input;
+  const ratio = fromRate / TARGET_SR;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(input.length, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+    let s = 0;
+    for (let j = start; j < end; j++) s += input[j];
+    out[i] = s / (end - start);
+  }
+  return out;
+}
+
+function handleFrame(frame) {
+  const level = rms(frame);
+  const isVoice = level > Math.max(0.008, noiseFloor * 3);
+  if (isVoice) {
+    lastVoiceAt = performance.now();
+    segHasVoice = true;
+  } else if (level < 0.02) {
+    // adapt to room noise, but only from genuinely quiet frames
+    noiseFloor = Math.min(0.02, noiseFloor * 0.97 + level * 0.03);
+  }
+  levelEl.style.width = `${Math.min(100, level * 400)}%`;
+  levelEl.style.background = isVoice ? '#3fb950' : '#566377';
+
+  pendingFrames.push(frame);
+  pendingSamples += frame.length;
+
+  const silenceFor = performance.now() - lastVoiceAt;
+
+  if (!segHasVoice) {
+    // buffer holds no speech: keep only a short tail (acts as pre-roll for
+    // the next utterance) instead of accumulating / re-transcribing silence
+    trimBufferTo(SILENCE_KEEP);
+  } else if (
+    (pendingSamples >= MIN_SEG_SAMPLES && silenceFor > SILENCE_MS) ||
+    pendingSamples >= MAX_SEG_SAMPLES
+  ) {
+    flushSegment();
+  }
+  if (recording) {
+    interimEl.textContent =
+      `listening… segment ${(pendingSamples / TARGET_SR).toFixed(1)}s` +
+      (queuedSegs ? ` (transcribing ${queuedSegs})` : '');
+  }
+}
+
+function concatFrames() {
+  const out = new Float32Array(pendingSamples);
+  let off = 0;
+  for (const f of pendingFrames) { out.set(f, off); off += f.length; }
+  pendingFrames = []; pendingSamples = 0;
+  return out;
+}
+
+function trimBufferTo(maxSamples) {
+  while (pendingFrames.length > 1 && pendingSamples - pendingFrames[0].length >= maxSamples) {
+    pendingSamples -= pendingFrames[0].length;
+    pendingFrames.shift();
+  }
+}
+
+// sequential transcription queue
+let queue = Promise.resolve();
+let queuedSegs = 0;
+
+function enqueueForTranscription(samples) {
+  if (samples.length < 400) return;
+  queuedSegs++;
+  queue = queue.then(async () => {
+    try {
+      const t0 = performance.now();
+      const text = (await transcribeSegment(samples)).trim();
+      if (text) {
+        transcriptEl.textContent += (transcriptEl.textContent ? ' ' : '') + text;
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+      }
+      console.log(`[stt] ${(samples.length / TARGET_SR).toFixed(1)}s audio → ${((performance.now() - t0) / 1000).toFixed(1)}s: "${text}"`);
+    } catch (e) {
+      console.error(e);
+      setStatus('Transcription error: ' + e.message, true);
+    } finally {
+      queuedSegs--;
+      if (recording && queuedSegs === 0) setStatus(`Listening (engine: ${engine}, device: ${usedDevice})…`);
+    }
+  });
+}
+
+function flushSegment(force = false) {
+  // never flush a segment that contains no detected speech
+  if (!segHasVoice && !force) return;
+  if (pendingSamples < (force ? 400 : MIN_SEG_SAMPLES)) return;
+
+  const all = concatFrames();
+  let seg = all;
+
+  if (force) {
+    segHasVoice = false;
+  } else if (all.length > MAX_SEG_SAMPLES) {
+    // Long continuous speech: cut at the quietest 100 ms window near the
+    // end instead of chopping mid-word; the remainder starts the next segment.
+    const win = TARGET_SR / 10;
+    const searchStart = Math.max(0, all.length - 1.5 * TARGET_SR);
+    let bestE = Infinity, bestI = all.length - win;
+    for (let i = searchStart; i + win <= all.length; i += win / 2) {
+      let e = 0;
+      for (let j = i; j < i + win; j++) e += all[j] * all[j];
+      if (e < bestE) { bestE = e; bestI = i + win / 2; }
+    }
+    const cut = Math.floor(bestI);
+    const remainder = all.slice(cut);
+    seg = all.slice(0, cut);
+    pendingFrames = [remainder];
+    pendingSamples = remainder.length;
+    segHasVoice = true; // remainder likely still contains speech
+  } else {
+    // Normal end-of-utterance: keep a short pre-roll so the next segment
+    // starts with context before the first detected voice frame.
+    const cut = Math.max(0, all.length - PRE_ROLL_SAMPLES);
+    seg = all.slice(0, cut);
+    const pre = all.slice(cut);
+    pendingFrames = [pre];
+    pendingSamples = pre.length;
+    segHasVoice = false;
+  }
+  enqueueForTranscription(seg);
+}
+
+async function start() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  audioCtx = new AudioContext({ sampleRate: TARGET_SR });
+  await audioCtx.audioWorklet.addModule(workletURL);
+  sourceNode = audioCtx.createMediaStreamSource(stream);
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-collector');
+  workletNode.port.onmessage = (e) => handleFrame(e.data);
+  sourceNode.connect(workletNode);
+
+  recording = true;
+  lastVoiceAt = performance.now();
+  startBtn.textContent = '⏹ Stop';
+  statusEl.insertAdjacentHTML('afterbegin', '<span class="rec-dot"></span>');
+  setStatus(`Listening (engine: ${engine}, device: ${usedDevice})…`);
+}
+
+async function stop() {
+  recording = false;
+  try {
+    stream.getTracks().forEach((t) => t.stop());
+    sourceNode.disconnect();
+    workletNode.port.onmessage = null;
+    await audioCtx.close();
+  } catch (_) { /* ignore */ }
+  stream = audioCtx = sourceNode = workletNode = null;
+  flushSegment(true); // transcribe anything left in the buffer
+  interimEl.textContent = '';
+  levelEl.style.width = '0';
+  startBtn.textContent = '▶ Start listening';
+  statusEl.textContent = 'Stopped.';
+}
+
+startBtn.addEventListener('click', () => (recording ? stop() : start().catch((e) => {
+  setStatus('Microphone error: ' + e.message, true);
+})));
+clearBtn.addEventListener('click', () => { transcriptEl.textContent = ''; });
+engineSel.addEventListener('change', () => { refreshModelOptions(); loadEngine(); });
+modelSel.addEventListener('change', loadEngine);
+
+refreshModelOptions();
+loadEngine();
+</script>
+</body>
+</html>

@@ -2,7 +2,8 @@
 	import { goto } from '$app/navigation';
 	import type { PageProps } from './$types';
 	import { api } from '#lib/client/api';
-	import { Recorder } from '#lib/client/recorder';
+	import { Recorder, type RecordingResult } from '#lib/client/recorder';
+	import { LocalStt, STT_ENGINES, type SttEngine, type SttLang } from '#lib/client/localStt';
 	import { formatDuration } from '#lib/client/format';
 	import RecordOrb from '#lib/components/RecordOrb.svelte';
 	import CategoryChip from '#lib/components/CategoryChip.svelte';
@@ -12,11 +13,11 @@
 	let { data }: PageProps = $props();
 
 	type Tab = 'capture' | 'notes';
-	type Phase = 'idle' | 'recording' | 'transcribing' | 'organizing' | 'review';
+	type Phase = 'idle' | 'recording' | 'loading' | 'transcribing' | 'organizing' | 'review';
 
 	let tab = $state<Tab>('capture');
 	let phase = $state<Phase>('idle');
-	let lang = $state<'en' | 'uk' | 'auto'>('auto');
+	let lang = $state<'en' | 'uk' | 'auto'>('uk');
 	let elapsed = $state(0);
 	let level = $state(0);
 	let errorMessage = $state('');
@@ -38,6 +39,26 @@
 
 	let recorder: Recorder | null = null;
 
+	// --- local (in-browser) speech recognition ---
+	const stt = new LocalStt();
+	const storedEngine = (typeof localStorage !== 'undefined'
+		? (localStorage.getItem('stt.engine') as SttEngine | null)
+		: null) ?? 'parakeet';
+	const initialEngine: SttEngine = STT_ENGINES[storedEngine] ? storedEngine : 'whisper';
+	let engineId = $state<SttEngine>(initialEngine);
+	let modelId = $state(
+		(typeof localStorage !== 'undefined' ? localStorage.getItem('stt.model') : null) ??
+			STT_ENGINES[initialEngine].models[0].value
+	);
+	let sttProgress = $state<{ pct: number; text: string } | null>(null);
+	const modelOptions = $derived(STT_ENGINES[engineId].models);
+	const langSupported = $derived(STT_ENGINES[engineId].supportsLang);
+
+	// --- live (real-time) transcription ---
+	let liveText = $state('');
+	let segChain: Promise<void> = Promise.resolve();
+	let segBusy = 0;
+
 	const filteredNotes = $derived.by(() => {
 		const q = search.trim().toLowerCase();
 		return notes.filter((n) => {
@@ -54,7 +75,7 @@
 			return;
 		}
 		if (phase !== 'idle') return;
-		if (!('MediaRecorder' in window) || !navigator.mediaDevices?.getUserMedia) {
+		if (!navigator.mediaDevices?.getUserMedia || typeof AudioWorkletNode === 'undefined') {
 			errorMessage = 'Audio recording is not supported in this browser.';
 			return;
 		}
@@ -62,33 +83,115 @@
 			recorder ??= new Recorder();
 			recorder.onLevel = (v) => (level = v);
 			recorder.onTick = (s) => (elapsed = s);
+			recorder.onSegment = handleSegment;
 			phase = 'recording';
 			elapsed = 0;
+			liveText = '';
 			await recorder.start();
+			beginModelLoad(); // warm up the model while the user speaks
 		} catch (e) {
 			phase = 'idle';
 			errorMessage = e instanceof Error ? e.message : 'Could not start recording';
 		}
 	}
 
+	/** Transcribes one live utterance segment; segments run strictly in order. */
+	function handleSegment(pcm: Float32Array) {
+		segBusy++;
+		segChain = segChain.then(async () => {
+			try {
+				// load() is a no-op once ready; reuses the in-flight promise otherwise
+				await stt.load(engineId, modelId, (p) => (sttProgress = p));
+				const text = (await stt.transcribe(pcm, lang)).trim();
+				if (text) liveText = liveText ? `${liveText} ${text}` : text;
+			} catch (e) {
+				console.warn('Live segment transcription failed:', e);
+			} finally {
+				segBusy--;
+			}
+		});
+	}
+
+	/** Kicks off model loading in the background (no await) with progress UI. */
+	function beginModelLoad() {
+		if (stt.isReady(engineId, modelId)) return;
+		sttProgress = { pct: 0, text: 'Preparing speech model…' };
+		stt
+			.load(engineId, modelId, (p) => (sttProgress = p))
+			.then(() => (sttProgress = null))
+			.catch((e: unknown) => {
+				sttProgress = null;
+				// surfaced again on stop; keep recording meanwhile
+				console.warn('Model load failed:', e);
+			});
+	}
+
+	async function ensureModelLoaded() {
+		if (stt.isReady(engineId, modelId)) return;
+		phase = 'loading';
+		try {
+			await stt.load(engineId, modelId, (p) => (sttProgress = p));
+		} finally {
+			sttProgress = null;
+		}
+	}
+
+	function onEngineChange(e: Event) {
+		engineId = (e.currentTarget as HTMLSelectElement).value as SttEngine;
+		modelId = STT_ENGINES[engineId].models[0].value;
+		persistSttChoice();
+	}
+
+	function onModelChange(e: Event) {
+		modelId = (e.currentTarget as HTMLSelectElement).value;
+		persistSttChoice();
+	}
+
+	function persistSttChoice() {
+		try {
+			localStorage.setItem('stt.engine', engineId);
+			localStorage.setItem('stt.model', modelId);
+		} catch {
+			/* private mode — ignore */
+		}
+	}
+
 	async function stopAndProcess() {
 		if (!recorder) return;
+		let rec: RecordingResult | null = null;
 		try {
-			const rec = await recorder.stop();
+			rec = await recorder.stop(); // emits the final live segment first
+		} catch (e) {
+			// too short / failed — but live text may still exist
+			if (!liveText.trim()) {
+				phase = 'idle';
+				errorMessage = e instanceof Error ? e.message : 'Recording failed';
+				return;
+			}
+		}
+		try {
+			// wait for any in-flight segment transcriptions to finish
 			phase = 'transcribing';
-			const form = new FormData();
-			form.append('audio', rec.blob, `rec.${rec.mimeType.includes('mp4') ? 'm4a' : 'webm'}`);
-			form.append('durationSec', String(Math.round(rec.durationSec)));
+			await segChain;
 
-			const { transcript: text } = await api.upload<{ transcript: string }>('/api/transcribe', form);
-			transcript = text;
+			if (liveText.trim()) {
+				transcript = liveText.trim();
+			} else {
+				// no segments were recognized live — transcribe the whole clip
+				if (!rec) throw new Error('Nothing was recorded');
+				await ensureModelLoaded();
+				transcript = await stt.transcribe(rec.pcm, lang);
+			}
+			if (!transcript.trim()) {
+				throw new Error('Nothing was recognized — try speaking louder or closer to the mic.');
+			}
 
 			phase = 'organizing';
 			const org = await api.post<{
 				text: string;
 				language: 'en' | 'uk';
 				proposed: ProposedCategory[];
-			}>('/api/organize', { transcript: text });
+			}>('/api/organize', { transcript });
 
 			cleanedText = org.text || transcript;
 			proposed = org.proposed;
@@ -159,6 +262,7 @@
 		level = 0;
 		elapsed = 0;
 		errorMessage = '';
+		liveText = '';
 	}
 
 	async function refreshCategories(): Promise<Category[]> {
@@ -209,24 +313,41 @@
 				<button
 					class="seg-item"
 					class:active={lang === l}
-					onclick={() => (lang = l as 'en' | 'uk' | 'auto')}
+					class:dimmed={!langSupported}
+					title={!langSupported ? 'Applies to Whisper — Parakeet auto-detects the language' : ''}
+					onclick={() => (lang = l as SttLang)}
 				>
 					{l === 'auto' ? '🌐 Auto' : l === 'en' ? 'EN' : 'UA'}
 				</button>
 			{/each}
 		</div>
 
+		<!-- speech engine + model -->
+		<div class="stt-config">
+			<select aria-label="Speech engine" onchange={onEngineChange} disabled={phase !== 'idle'}>
+				<option value="whisper" selected={engineId === 'whisper'}>Whisper</option>
+				<option value="parakeet" selected={engineId === 'parakeet'}>Parakeet v3 · auto</option>
+			</select>
+			<select aria-label="Speech model" onchange={onModelChange} disabled={phase !== 'idle'}>
+				{#each modelOptions as m (m.value)}
+					<option value={m.value} selected={modelId === m.value}>{m.label}</option>
+				{/each}
+			</select>
+		</div>
+
 		<!-- orb + timer -->
 		<div class="stage">
 			<RecordOrb
 				recording={phase === 'recording'}
-				processing={phase === 'transcribing' || phase === 'organizing'}
+				processing={phase === 'loading' || phase === 'transcribing' || phase === 'organizing'}
 				level={phase === 'recording' ? level : 0}
 				onclick={toggleRecording}
 			/>
 			<p class="hint" class:rec={phase === 'recording'}>
 				{#if phase === 'recording'}
 					<span class="timer">{formatDuration(elapsed)}</span> — tap to stop
+				{:else if phase === 'loading'}
+					{sttProgress?.text ?? 'Loading speech model…'}
 				{:else if phase === 'transcribing'}
 					Transcribing…
 				{:else if phase === 'organizing'}
@@ -235,6 +356,17 @@
 					Tap to record a note
 				{/if}
 			</p>
+			{#if sttProgress && (phase === 'recording' || phase === 'loading')}
+				<div class="dl-bar"><div class="dl-fill" style:width={`${sttProgress.pct}%`}></div></div>
+			{/if}
+
+			<!-- live transcript while recording / finishing -->
+			{#if liveText && (phase === 'recording' || phase === 'transcribing')}
+				<div class="live-box">
+					<p class="live-label faint">{segBusy > 0 ? 'transcribing…' : 'live'}</p>
+					<p class="live-text">{liveText}</p>
+				</div>
+			{/if}
 			{#if errorMessage && phase === 'idle'}<p class="error-text">{errorMessage}</p>{/if}
 		</div>
 
@@ -384,6 +516,64 @@
 	.seg-item.active {
 		background: var(--accent-dim);
 		color: var(--accent-soft);
+	}
+
+	.seg-item:disabled {
+		opacity: 0.35;
+	}
+
+	.seg-item.dimmed {
+		opacity: 0.4;
+	}
+
+	.stt-config {
+		display: flex;
+		gap: 8px;
+	}
+
+	.stt-config select {
+		background: var(--bg-card);
+		color: var(--text);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-pill);
+		font-size: 13px;
+		padding: 7px 12px;
+		max-width: 200px;
+	}
+
+	.dl-bar {
+		width: 180px;
+		height: 4px;
+		border-radius: 2px;
+		background: var(--bg-card);
+		overflow: hidden;
+	}
+
+	.dl-fill {
+		height: 100%;
+		background: var(--accent);
+		transition: width 0.15s;
+	}
+
+	.live-box {
+		max-width: 560px;
+		background: var(--bg-card);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-md);
+		padding: 10px 14px;
+	}
+
+	.live-label {
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+	}
+
+	.live-text {
+		font-size: 15px;
+		white-space: pre-wrap;
+		max-height: 180px;
+		overflow-y: auto;
 	}
 
 	.stage {

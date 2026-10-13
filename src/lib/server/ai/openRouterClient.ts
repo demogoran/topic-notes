@@ -1,4 +1,5 @@
 import { OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_APP_TITLE } from '$app/env/private';
+import { writeFile } from 'fs/promises';
 import { error } from '@sveltejs/kit';
 import type { ChatMessage } from '#lib/server/ai/organize';
 import { audioFormatFromMime, type OrganizeResult } from '#lib/server/ai/organize';
@@ -22,7 +23,7 @@ interface TranscribeOptions {
 export class OpenRouterClient {
 	constructor(
 		private readonly apiKey: string = OPENROUTER_API_KEY ?? '',
-		private readonly baseUrl = 'https://openrouter.ai/api/v1',
+		private readonly baseUrl = 'https://api.neuralwatt.com/v1',//'https://openrouter.ai/api/v1',
 		private readonly model = OPENROUTER_MODEL,
 		private readonly appTitle = OPENROUTER_APP_TITLE
 	) { }
@@ -40,6 +41,7 @@ export class OpenRouterClient {
 				: languageHint === 'en'
 					? 'The audio is in English.'
 					: 'The audio is in English or Ukrainian.';
+
 		const raw = await this.chat([
 			{
 				role: 'user',
@@ -55,6 +57,8 @@ export class OpenRouterClient {
 				]
 			}
 		]);
+
+		console.log('transcribe response:', raw);
 		return raw.trim();
 	}
 
