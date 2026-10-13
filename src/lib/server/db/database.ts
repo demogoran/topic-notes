@@ -67,5 +67,28 @@ function migrate(db: Database.Database): void {
 			PRIMARY KEY (note_id, category_id)
 		);
 		CREATE INDEX IF NOT EXISTS idx_note_categories_cat ON note_categories(category_id);
+
+		CREATE TABLE IF NOT EXISTS todo_items (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+			text TEXT NOT NULL,
+			done INTEGER NOT NULL DEFAULT 0,
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_todo_items_note ON todo_items(note_id, position);
+
+		CREATE TABLE IF NOT EXISTS todo_item_categories (
+			todo_item_id INTEGER NOT NULL REFERENCES todo_items(id) ON DELETE CASCADE,
+			category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+			PRIMARY KEY (todo_item_id, category_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_todo_item_categories_cat ON todo_item_categories(category_id);
 	`);
+
+	// Incremental migration: notes.type for DBs created before note types existed.
+	const cols = db.prepare(`PRAGMA table_info(notes)`).all() as Array<{ name: string }>;
+	if (!cols.some((c) => c.name === 'type')) {
+		db.exec(`ALTER TABLE notes ADD COLUMN type TEXT NOT NULL DEFAULT 'text'`);
+	}
 }

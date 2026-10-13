@@ -30,9 +30,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	const noteId = Number(body.noteId);
 	if (Number.isInteger(noteId) && noteId > 0) {
 		const { NoteService } = await import('#lib/server/notesService');
-		const updated = await new NoteService().updateText(userId, noteId, {
+		const updated = await new NoteService().update(userId, noteId, {
 			text: result.text,
 			status: 'final',
+			type: 'text',
 			categories: result.proposed.map((p) => p.name)
 		});
 		return json({ note: updated, proposed });

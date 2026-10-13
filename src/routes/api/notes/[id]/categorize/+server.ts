@@ -33,7 +33,7 @@ export const POST: RequestHandler = async ({ params, locals }) => {
 		return { name: p.name, categoryId: match?.id ?? null };
 	});
 
-	const updated = noteService.updateText(userId, noteId, {
+	const updated = noteService.update(userId, noteId, {
 		text: finalText,
 		status: 'final',
 		categories: proposed.map((p) => p.name)

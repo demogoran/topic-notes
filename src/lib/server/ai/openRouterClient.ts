@@ -4,6 +4,13 @@ import { error } from '@sveltejs/kit';
 import type { ChatMessage } from '#lib/server/ai/organize';
 import { audioFormatFromMime, type OrganizeResult } from '#lib/server/ai/organize';
 import { buildOrganizeMessages, parseOrganizeResponse, type ExistingCategory } from '#lib/server/ai/organize';
+import {
+	buildDetectTypeMessages,
+	buildFormatMessages,
+	parseDetectTypeResponse,
+	parseFormatResponse
+} from '#lib/server/ai/noteTypes';
+import type { DetectedType, FormatResult, NoteType } from '#lib/shared/types';
 
 interface ChatCompletionResponse {
 	choices?: Array<{ message?: { content?: string | null } }>;
@@ -32,6 +39,25 @@ export class OpenRouterClient {
 	async organize(transcript: string, existing: ExistingCategory[]): Promise<OrganizeResult> {
 		const raw = await this.chat(buildOrganizeMessages(transcript, existing));
 		return parseOrganizeResponse(raw, transcript);
+	}
+
+	/** Step 1 of the capture workflow — an explicit LLM call to pick the best note type. */
+	async detectType(transcript: string): Promise<DetectedType> {
+		const raw = await this.chat(buildDetectTypeMessages(transcript));
+		return parseDetectTypeResponse(raw);
+	}
+
+	/** Step 2 of the capture workflow — an explicit, type-specific LLM call. */
+	async formatNote(transcript: string, type: NoteType): Promise<FormatResult> {
+		const raw = await this.chat(buildFormatMessages(transcript, type));
+		const parsed = parseFormatResponse(raw, type, transcript);
+		return {
+			type,
+			language: parsed.language,
+			text: parsed.text,
+			categories: parsed.categories.map((name) => ({ name, categoryId: null })),
+			todos: parsed.todos
+		};
 	}
 
 	async transcribe({ audio, mimeType, languageHint }: TranscribeOptions): Promise<string> {

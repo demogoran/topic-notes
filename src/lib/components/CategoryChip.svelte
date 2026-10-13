@@ -4,12 +4,14 @@
 		selected?: boolean;
 		dimmed?: boolean;
 		onclick?: () => void;
+		/** Reduced padding/font — used for per-task tags inside checklists. */
+		small?: boolean;
 	}
 
-	let { name, selected = false, dimmed = false, onclick }: Props = $props();
+	let { name, selected = false, dimmed = false, small = false, onclick }: Props = $props();
 </script>
 
-<button class="chip cat-chip" {onclick} style={chipStyle(name, selected)} class:dimmed>
+<button class="chip cat-chip" class:small {onclick} style={chipStyle(name, selected)} class:dimmed>
 	{name}
 </button>
 
@@ -36,6 +38,11 @@
 
 	.cat-chip.dimmed {
 		opacity: 0.55;
+	}
+
+	.cat-chip.small {
+		font-size: 11px;
+		padding: 2px 8px;
 	}
 
 	.cat-chip:active {

@@ -9,12 +9,28 @@
 	import RecordOrb from '#lib/components/RecordOrb.svelte';
 	import CategoryChip from '#lib/components/CategoryChip.svelte';
 	import NoteCard from '#lib/components/NoteCard.svelte';
-	import type { Category, NoteWithCategories, ProposedCategory } from '#lib/shared/types';
+	import type {
+		Category,
+		NoteType,
+		NoteTypeInfo,
+		NoteWithCategories,
+		ProposedCategory,
+		ProposedTodo
+	} from '#lib/shared/types';
+	import { NOTE_TYPES } from '#lib/shared/types';
 
 	let { data }: PageProps = $props();
 
 	type Tab = 'capture' | 'notes';
-	type Phase = 'idle' | 'recording' | 'loading' | 'transcribing' | 'organizing' | 'review';
+	type Phase =
+		| 'idle'
+		| 'recording'
+		| 'loading'
+		| 'transcribing'
+		| 'detecting'
+		| 'typeSelect'
+		| 'formatting'
+		| 'review';
 
 	let tab = $state<Tab>('capture');
 	let phase = $state<Phase>('idle');
@@ -23,10 +39,20 @@
 	let level = $state(0);
 	let errorMessage = $state('');
 
-	// review state
+	// --- capture workflow state (transcribe → detect type → user picks → format) ---
 	let transcript = $state('');
-	let cleanedText = $state('');
+	let aiType = $state<NoteType>('text');
+	let aiReason = $state('');
+	let typeInfos = $state<NoteTypeInfo[]>([]);
+	let selectedType = $state<NoteType>('text');
+
+	// format result (type-specific)
+	let fmtText = $state('');
+	let fmtLanguage = $state<'en' | 'uk'>('en');
 	let proposed = $state<ProposedCategory[]>([]);
+	let proposedTodos = $state<ProposedTodo[]>([]);
+	/** Editable checklist draft during review (todo type). */
+	let draftTodos = $state<{ text: string; done: boolean; tags: string[] }[]>([]);
 	/** Selected category names (case-insensitive). Includes new ones — the API creates them. */
 	let selectedNames = $state<string[]>([]);
 	let newCatName = $state('');
@@ -88,13 +114,47 @@
 	const soniox = new SonioxStt();
 	const usingSoniox = $derived(engineId === 'soniox');
 
+	// --- notes tab filtering (tags aggregate across todolists) ---
+	const activeTag = $derived(
+		activeFilter === 'all' ? null : (categories.find((c) => c.id === activeFilter) ?? null)
+	);
+
 	const filteredNotes = $derived.by(() => {
 		const q = search.trim().toLowerCase();
 		return notes.filter((n) => {
-			const matchCat = activeFilter === 'all' || n.categories.some((c) => c.id === activeFilter);
-			const matchQ = q === '' || n.text.toLowerCase().includes(q);
-			return matchCat && matchQ;
+			const tagMatch =
+				activeFilter === 'all' ||
+				n.categories.some((c) => c.id === activeFilter) ||
+				n.todoItems.some((t) => t.tags.some((tg) => tg.id === activeFilter));
+			const textMatch =
+				q === '' ||
+				n.text.toLowerCase().includes(q) ||
+				n.transcript.toLowerCase().includes(q) ||
+				n.categories.some((c) => c.name.toLowerCase().includes(q)) ||
+				n.todoItems.some(
+					(t) =>
+						t.text.toLowerCase().includes(q) ||
+						t.tags.some((tg) => tg.name.toLowerCase().includes(q))
+				);
+			return tagMatch && textMatch;
 		});
+	});
+
+	/** All tasks (across every todolist) matching the active tag — the aggregation view. */
+	const aggregatedTasks = $derived.by(() => {
+		if (!activeTag) return [];
+		const q = search.trim().toLowerCase();
+		const out: { note: NoteWithCategories; itemId: number; text: string; done: boolean; tags: { id: number; name: string }[] }[] = [];
+		for (const n of notes) {
+			for (const t of n.todoItems) {
+				const tagHit = t.tags.some((tg) => tg.id === activeFilter);
+				const qHit = q === '' || t.text.toLowerCase().includes(q) || t.tags.some((tg) => tg.name.toLowerCase().includes(q));
+				if (tagHit && qHit) {
+					out.push({ note: n, itemId: t.id, text: t.text, done: t.done, tags: t.tags });
+				}
+			}
+		}
+		return out;
 	});
 
 	async function toggleRecording() {
@@ -227,11 +287,6 @@
 				return;
 			}
 			sonioxState = 'idle';
-			if (!transcript.trim()) {
-				phase = 'idle';
-				errorMessage = 'Nothing was recognized — try speaking louder or closer to the mic.';
-				return;
-			}
 		} else {
 			if (!recorder) return;
 			let rec: RecordingResult | null = null;
@@ -258,9 +313,6 @@
 					await ensureModelLoaded();
 					transcript = await stt.transcribe(rec.pcm, lang);
 				}
-				if (!transcript.trim()) {
-					throw new Error('Nothing was recognized — try speaking louder or closer to the mic.');
-				}
 			} catch (e) {
 				phase = 'idle';
 				errorMessage = e instanceof Error ? e.message : 'Processing failed';
@@ -268,26 +320,65 @@
 			}
 		}
 
-		try {
-			phase = 'organizing';
-			const org = await api.post<{
-				text: string;
-				language: 'en' | 'uk';
-				proposed: ProposedCategory[];
-			}>('/api/organize', { transcript });
+		if (!transcript.trim()) {
+			phase = 'idle';
+			errorMessage = 'Nothing was recognized — try speaking louder or closer to the mic.';
+			return;
+		}
 
-			cleanedText = org.text || transcript;
-			proposed = org.proposed;
-			categories = await refreshCategories();
-			// preselect everything the AI proposed (new labels included — they are
-			// created on save); the user can tap any chip off/on before saving
-			selectedNames = org.proposed.map((p) => p.name);
-			newCatName = '';
-			phase = 'review';
+		// --- explicit AI step 1: pick the best note type ---
+		try {
+			phase = 'detecting';
+			const det = await api.post<{ type: NoteType; reason: string; types: NoteTypeInfo[] }>(
+				'/api/notes/detect-type',
+				{ transcript }
+			);
+			aiType = det.type;
+			aiReason = det.reason;
+			typeInfos = det.types;
+			selectedType = det.type;
+			phase = 'typeSelect';
 		} catch (e) {
 			phase = 'idle';
 			errorMessage = e instanceof Error ? e.message : 'Processing failed';
 		}
+	}
+
+	/** Explicit AI step 2: type-specific formatting for the user-selected type. */
+	async function runFormat() {
+		errorMessage = '';
+		try {
+			phase = 'formatting';
+			const fmt = await api.post<{
+				type: NoteType;
+				language: 'en' | 'uk';
+				text: string;
+				categories: ProposedCategory[];
+				todos: ProposedTodo[];
+			}>('/api/notes/format', { transcript, type: selectedType });
+
+			fmtText = fmt.text || transcript;
+			fmtLanguage = fmt.language;
+			proposed = fmt.categories;
+			proposedTodos = fmt.todos;
+			categories = await refreshCategories();
+			draftTodos = fmt.todos.map((t) => ({ text: t.text, done: t.done, tags: [...t.tags] }));
+			// preselect everything the AI proposed (new labels included — they are
+			// created on save); the user can tap any chip off/on before saving
+			selectedNames = fmt.categories.map((p) => p.name);
+			newCatName = '';
+			phase = 'review';
+		} catch (e) {
+			phase = 'typeSelect';
+			errorMessage = e instanceof Error ? e.message : 'Processing failed';
+		}
+	}
+
+	/** Allows re-picking a type from the review screen (re-runs step 2). */
+	async function changeType(t: NoteType) {
+		if (t === selectedType || phase !== 'review') return;
+		selectedType = t;
+		await runFormat();
 	}
 
 	const eqName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
@@ -327,6 +418,47 @@
 		)
 	);
 
+	// --- per-task tag editing (todo review) ---
+
+	/** Every tag name known right now: existing categories + tags used in the draft. */
+	const knownTagNames = $derived.by(() => {
+		const set = new Map<string, string>(); // lowercase → display
+		for (const c of categories) set.set(c.name.toLowerCase(), c.name);
+		for (const p of proposed) set.set(p.name.toLowerCase(), p.name);
+		for (const t of draftTodos) for (const tg of t.tags) set.set(tg.toLowerCase(), tg);
+		return [...set.values()];
+	});
+
+	function toggleTaskTag(taskIdx: number, tag: string) {
+		const t = draftTodos[taskIdx];
+		const lower = tag.toLowerCase();
+		t.tags = t.tags.some((x) => x.toLowerCase() === lower)
+			? t.tags.filter((x) => x.toLowerCase() !== lower)
+			: [...t.tags, tag];
+	}
+
+	function commitTaskTag(taskIdx: number, e: Event) {
+		e.preventDefault();
+		const input = e.currentTarget as HTMLInputElement;
+		for (const part of input.value.split(',')) {
+			const tag = part.trim();
+			if (tag && !draftTodos[taskIdx].tags.some((x) => x.toLowerCase() === tag.toLowerCase())) {
+				draftTodos[taskIdx] = { ...draftTodos[taskIdx], tags: [...draftTodos[taskIdx].tags, tag] };
+			}
+		}
+		input.value = '';
+	}
+
+	function addTask() {
+		draftTodos = [...draftTodos, { text: '', done: false, tags: [] }];
+	}
+
+	function removeTask(idx: number) {
+		draftTodos = draftTodos.filter((_, i) => i !== idx);
+	}
+
+	// --- save / discard ---
+
 	async function saveNote() {
 		if (saving) return;
 		saving = true;
@@ -343,11 +475,18 @@
 			for (const n of [...selectedNames, ...pendingNames]) {
 				if (n && !names.some((x) => eqName(x, n))) names.push(n);
 			}
+			const todos =
+				selectedType === 'todo'
+					? draftTodos.filter((t) => t.text.trim()).map((t) => ({ text: t.text.trim(), done: t.done, tags: t.tags }))
+					: undefined;
+			const text = (selectedType === 'todo' ? fmtText || 'Todo list' : fmtText || transcript).trim();
 			await api.post('/api/notes', {
-				text: cleanedText || transcript,
+				text,
 				transcript,
 				status: 'final',
-				categories: names
+				type: selectedType,
+				categories: names,
+				todos
 			});
 			resetCapture();
 			tab = 'notes';
@@ -368,8 +507,14 @@
 		sonioxState = 'idle';
 		phase = 'idle';
 		transcript = '';
-		cleanedText = '';
+		aiType = 'text';
+		aiReason = '';
+		typeInfos = [];
+		selectedType = 'text';
+		fmtText = '';
 		proposed = [];
+		proposedTodos = [];
+		draftTodos = [];
 		selectedNames = [];
 		newCatName = '';
 		level = 0;
@@ -390,6 +535,16 @@
 			notes = res.notes;
 		} finally {
 			notesLoading = false;
+		}
+	}
+
+	async function toggleTodoItem(noteId: number, itemId: number, done: boolean) {
+		try {
+			await api.patch(`/api/notes/${noteId}/todos/${itemId}`, { done });
+		} finally {
+			// refetch only that note's fresh state to stay in sync
+			const { note } = await api.get<{ note: NoteWithCategories }>(`/api/notes/${noteId}`);
+			notes = notes.map((n) => (n.id === noteId ? note : n));
 		}
 	}
 
@@ -464,7 +619,7 @@
 		<div class="stage">
 			<RecordOrb
 				recording={phase === 'recording'}
-				processing={phase === 'loading' || phase === 'transcribing' || phase === 'organizing'}
+				processing={phase === 'loading' || phase === 'transcribing' || phase === 'detecting' || phase === 'formatting'}
 				level={phase === 'recording' ? level : 0}
 				onclick={toggleRecording}
 			/>
@@ -475,8 +630,10 @@
 					{sttProgress?.text ?? 'Loading speech model…'}
 				{:else if phase === 'transcribing'}
 					Transcribing…
-				{:else if phase === 'organizing'}
-					Organizing…
+				{:else if phase === 'detecting'}
+					Choosing the note type…
+				{:else if phase === 'formatting'}
+					Formatting as {selectedType}…
 				{:else}
 					Tap to record a note
 				{/if}
@@ -503,16 +660,86 @@
 			{#if errorMessage && phase === 'idle'}<p class="error-text">{errorMessage}</p>{/if}
 		</div>
 
-		<!-- review card -->
+		<!-- step 1 result: type selection (AI proposal highlighted) -->
+		{#if phase === 'typeSelect'}
+			<div class="review card">
+				<p class="label">What kind of note is this?</p>
+				<p class="ai-reason faint">🤖 AI suggests <strong>{aiType}</strong>{#if aiReason} — {aiReason}{/if}</p>
+				<div class="type-grid">
+					{#each NOTE_TYPES as t (t)}
+						{@const info = typeInfos.find((i) => i.type === t)}
+						<button
+							class="type-card"
+							class:aiPick={t === aiType}
+							class:picked={t === selectedType && t !== aiType}
+							onclick={() => {
+								selectedType = t;
+								runFormat();
+							}}
+						>
+							<span class="type-label">
+								{#if t === aiType}<span class="ai-badge">AI pick</span>{/if}
+								{info?.label ?? t}
+							</span>
+							<span class="type-desc faint">{info?.description ?? ''}</span>
+						</button>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- step 2 result: type-specific review -->
 		{#if phase === 'review'}
 			<div class="review card">
-				<label class="label" for="note-text">Note text</label>
-				<textarea id="note-text" rows="5" bind:value={cleanedText}></textarea>
+				<p class="label">
+					{selectedType === 'todo' ? 'Todolist' : selectedType === 'prompt' ? 'Refined prompt' : selectedType === 'summary' ? 'Summary' : 'Note text'}
+					<button class="link-btn faint" onclick={() => (phase = 'typeSelect')}>change type</button>
+				</p>
 
-				<details class="raw">
-					<summary class="faint">Raw transcript</summary>
-					<p class="muted raw-text">{transcript}</p>
-				</details>
+				<!-- text / prompt / summary share the same editor -->
+				{#if selectedType !== 'todo'}
+					<textarea id="note-text" rows={selectedType === 'text' ? 5 : 8} bind:value={fmtText}></textarea>
+				{:else}
+					<label class="label sub" for="todo-title">List title</label>
+					<input id="todo-title" bind:value={fmtText} placeholder="List title" />
+				{/if}
+
+				{#if selectedType === 'todo'}
+					<p class="label sect">Tasks</p>
+					<ul class="draft-todos">
+						{#each draftTodos as t, i (i)}
+							<li class="draft-task">
+								<label class="check">
+									<input type="checkbox" bind:checked={t.done} />
+								</label>
+								<input class="task-input" placeholder="Task" bind:value={t.text} />
+								<button class="rm-task faint" title="Remove task" onclick={() => removeTask(i)}>✕</button>
+								<div class="task-tags">
+									{#each t.tags as tg (tg)}
+										<CategoryChip name={tg} small selected onclick={() => toggleTaskTag(i, tg)} />
+									{/each}
+									{#each knownTagNames as k (k)}
+										{#if !t.tags.some((x) => x.toLowerCase() === k.toLowerCase())}
+											<CategoryChip name={k} small dimmed onclick={() => toggleTaskTag(i, k)} />
+										{/if}
+									{/each}
+									<input class="tag-input" placeholder="+ tag" onkeydown={(e) => e.key === 'Enter' && commitTaskTag(i, e)} />
+								</div>
+							</li>
+						{/each}
+					</ul>
+					<button class="btn btn-ghost add-task" onclick={addTask}>+ Add task</button>
+				{:else if selectedType !== 'text'}
+					<details class="raw">
+						<summary class="faint">Raw transcript</summary>
+						<p class="muted raw-text">{transcript}</p>
+					</details>
+				{:else}
+					<details class="raw">
+						<summary class="faint">Raw transcript</summary>
+						<p class="muted raw-text">{transcript}</p>
+					</details>
+				{/if}
 
 				<p class="label sect">Categories</p>
 				<div class="chips">
@@ -577,9 +804,9 @@
 		<div class="field">
 			<input
 				type="search"
-				placeholder="Search notes…"
+				placeholder="Search notes, tasks and tags…"
 				bind:value={search}
-				aria-label="Search notes"
+				aria-label="Search notes, tasks and tags"
 			/>
 		</div>
 
@@ -593,13 +820,36 @@
 			</button>
 			{#each categories as c (c.id)}
 				<CategoryChip
-					name={c.name}
+					name={c.name + (c.taskCount > 0 ? ` · ${c.taskCount}⚑` : '')}
 					selected={activeFilter === c.id}
 					onclick={() => (activeFilter = activeFilter === c.id ? 'all' : c.id)}
 				/>
 			{/each}
 			<span class="manage-hint faint">long-press to manage</span>
 		</div>
+
+		<!-- aggregated tasks across all todolists for the selected tag -->
+		{#if activeTag && aggregatedTasks.length > 0}
+			<div class="card tag-aggregation">
+				<p class="label">⚑ “{activeTag.name}” tasks — all lists ({aggregatedTasks.length})</p>
+				<ul class="agg-list">
+					{#each aggregatedTasks as at (`${at.note.id}:${at.itemId}`)}
+						<li class:done={at.done}>
+							<input
+								type="checkbox"
+								checked={at.done}
+								onchange={(e) => toggleTodoItem(at.note.id, at.itemId, (e.currentTarget as HTMLInputElement).checked)}
+							/>
+							<span class="agg-task">{at.text}</span>
+							<span class="agg-src faint">from “{at.note.text.slice(0, 40) || 'todolist'}”</span>
+							{#each at.tags.filter((t) => t.id !== activeTag?.id) as t (t.id)}
+								<CategoryChip name={t.name} small />
+							{/each}
+						</li>
+					{/each}
+				</ul>
+			</div>
+		{/if}
 
 		<div class="note-list">
 			{#if notesLoading}
@@ -613,7 +863,7 @@
 				</div>
 			{:else}
 				{#each filteredNotes as note (note.id)}
-					<NoteCard {note} ondelete={deleteNote} />
+					<NoteCard {note} ondelete={deleteNote} ontoggletodo={toggleTodoItem} />
 				{/each}
 			{/if}
 		</div>
@@ -752,6 +1002,74 @@
 		min-height: 110px;
 	}
 
+	.ai-reason {
+		font-size: 13px;
+		margin: 6px 0 12px;
+	}
+
+	.type-grid {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 10px;
+	}
+
+	.type-card {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		text-align: left;
+		padding: 12px 14px;
+		border: 1px solid var(--line);
+		border-radius: var(--radius-md);
+		background: var(--bg);
+		transition: border-color 0.15s, background 0.15s;
+	}
+
+	.type-card.aiPick {
+		border-color: rgba(139, 92, 246, 0.65);
+		background: var(--accent-dim);
+		box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.35);
+	}
+
+	.type-card.picked {
+		border-color: var(--accent);
+		background: var(--accent-dim);
+	}
+
+	.type-label {
+		font-weight: 700;
+		font-size: 14px;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.ai-badge {
+		font-size: 10px;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: #fff;
+		background: var(--accent);
+		border-radius: var(--radius-pill);
+		padding: 2px 7px;
+	}
+
+	.type-desc {
+		font-size: 12px;
+	}
+
+	.link-btn {
+		font-size: 12px;
+		text-decoration: underline;
+		margin-left: auto;
+	}
+
+	.label.sub {
+		font-size: 12px;
+		margin-top: 10px;
+	}
+
 	.sect {
 		margin-top: 16px;
 	}
@@ -780,6 +1098,69 @@
 		font-size: 13px;
 		margin-top: 6px;
 		white-space: pre-wrap;
+	}
+
+	/* todo draft editor */
+	.draft-todos {
+		list-style: none;
+		padding: 0;
+		margin: 8px 0 0;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.draft-task {
+		display: grid;
+		grid-template-columns: auto 1fr auto;
+		gap: 8px;
+		align-items: center;
+		border: 1px solid var(--line);
+		border-radius: var(--radius-md);
+		padding: 8px 10px;
+		background: var(--bg);
+	}
+
+	.draft-task .check input {
+		width: 18px;
+		height: 18px;
+		accent-color: var(--accent);
+	}
+
+	.task-input {
+		border: none;
+		background: transparent;
+		color: var(--text);
+		font-size: 14px;
+		width: 100%;
+	}
+
+	.rm-task {
+		font-size: 13px;
+		padding: 2px 6px;
+	}
+
+	.task-tags {
+		grid-column: 1 / -1;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+		align-items: center;
+	}
+
+	.tag-input {
+		background: transparent;
+		border: 1px dashed var(--line);
+		border-radius: var(--radius-pill);
+		color: var(--text);
+		font-size: 11px;
+		padding: 2px 8px;
+		width: 70px;
+	}
+
+	.add-task {
+		margin-top: 8px;
+		font-size: 13px;
 	}
 
 	.newcat {
@@ -831,6 +1212,48 @@
 	.manage-hint {
 		font-size: 12px;
 		display: none;
+	}
+
+	.tag-aggregation {
+		padding: 12px 14px;
+		border-color: rgba(139, 92, 246, 0.35);
+	}
+
+	.agg-list {
+		list-style: none;
+		padding: 0;
+		margin: 8px 0 0;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.agg-list li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 14px;
+		flex-wrap: wrap;
+	}
+
+	.agg-list li input {
+		width: 17px;
+		height: 17px;
+		accent-color: var(--accent);
+		flex-shrink: 0;
+	}
+
+	.agg-list li.done .agg-task {
+		text-decoration: line-through;
+		color: var(--text-faint);
+	}
+
+	.agg-task {
+		overflow-wrap: anywhere;
+	}
+
+	.agg-src {
+		font-size: 11px;
 	}
 
 	.note-list {

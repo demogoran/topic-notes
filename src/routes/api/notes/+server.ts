@@ -2,6 +2,7 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { requireUser } from '#lib/server/guards';
 import { NoteService } from '#lib/server/notesService';
+import { isNoteType } from '#lib/shared/types';
 
 const noteService = new NoteService();
 
@@ -26,7 +27,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 		transcript: typeof body.transcript === 'string' ? body.transcript : '',
 		audioDb: null,
 		status: body.status === 'final' ? 'final' : 'draft',
-		categories: body.categories
+		type: isNoteType(body.type) ? body.type : 'text',
+		categories: body.categories,
+		todos: body.todos
 	});
 	return json({ note }, { status: 201 });
 };
