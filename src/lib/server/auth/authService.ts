@@ -1,5 +1,6 @@
 import { error, type Cookies } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
+import { dev } from '$app/env';
+import { SESSION_TTL_DAYS } from '$app/env/private';
 import { generateSessionToken, hashPassword, verifyPassword } from '#lib/server/auth/password';
 import { makeSessionRepo, makeUserRepo, rowToUser } from '#lib/server/db/repositories';
 import type { PublicUser } from '#lib/shared/types';
@@ -7,7 +8,7 @@ import type { PublicUser } from '#lib/shared/types';
 export const SESSION_COOKIE = 'vn_session';
 
 export function sessionTtlMs(): number {
-	return Number(env.SESSION_TTL_DAYS ?? 30) * 24 * 60 * 60 * 1000;
+	return SESSION_TTL_DAYS * 24 * 60 * 60 * 1000;
 }
 
 /**
@@ -65,7 +66,7 @@ export function setSessionCookie(cookies: Cookies, token: string): void {
 		path: '/',
 		httpOnly: true,
 		sameSite: 'lax',
-		secure: env.NODE_ENV === 'production',
+		secure: !dev,
 		maxAge: Math.floor(sessionTtlMs() / 1000)
 	});
 }

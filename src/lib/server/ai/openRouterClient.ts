@@ -1,4 +1,4 @@
-import { env } from '$env/dynamic/private';
+import { OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_APP_TITLE } from '$app/env/private';
 import { error } from '@sveltejs/kit';
 import type { ChatMessage } from '#lib/server/ai/organize';
 import { audioFormatFromMime, type OrganizeResult } from '#lib/server/ai/organize';
@@ -21,15 +21,12 @@ interface TranscribeOptions {
  */
 export class OpenRouterClient {
 	constructor(
-		private readonly apiKey: string = env.OPENROUTER_API_KEY ?? '',
+		private readonly apiKey: string = OPENROUTER_API_KEY ?? '',
 		private readonly baseUrl = 'https://openrouter.ai/api/v1',
-		private readonly model = env.OPENROUTER_MODEL ?? 'xiaomi/mimo-v2.6-flash',
-		private readonly appTitle = env.OPENROUTER_APP_TITLE ?? 'VoiceNotes'
-	) {}
+		private readonly model = OPENROUTER_MODEL,
+		private readonly appTitle = OPENROUTER_APP_TITLE
+	) { }
 
-	isConfigured(): boolean {
-		return this.apiKey.length > 0;
-	}
 
 	async organize(transcript: string, existing: ExistingCategory[]): Promise<OrganizeResult> {
 		const raw = await this.chat(buildOrganizeMessages(transcript, existing));
@@ -62,8 +59,8 @@ export class OpenRouterClient {
 	}
 
 	private async chat(messages: ChatMessage[]): Promise<string> {
-		if (!this.isConfigured()) {
-			throw error(503, 'AI service is not configured: set OPENROUTER_API_KEY');
+		if (this.apiKey.length === 0) {
+			throw error(503, 'AI service is not configured: set OPENROUTER_API_KEY in .env');
 		}
 		let res: Response;
 		try {

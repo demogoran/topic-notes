@@ -1,4 +1,4 @@
-import { env } from '$env/dynamic/private';
+import { AUDIO_DIR } from '$app/env/private';
 
 export interface AudioMeta {
 	filename: string;
@@ -16,7 +16,7 @@ export class AudioStore {
 	private readonly dir: string;
 
 	constructor() {
-		this.dir = env.AUDIO_DIR ?? './data/audio';
+		this.dir = AUDIO_DIR;
 	}
 
 	async save(userId: number, noteId: number, data: Buffer, ext: string): Promise<string> {

@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { env } from '$env/dynamic/private';
+import { DATABASE_PATH } from '$app/env/private';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
@@ -12,7 +12,7 @@ let instance: Database.Database | null = null;
 export function getDb(): Database.Database {
 	if (instance) return instance;
 
-	const file = resolve(env.DATABASE_PATH ?? './data/app.db');
+	const file = resolve(DATABASE_PATH);
 	mkdirSync(dirname(file), { recursive: true });
 
 	const db = new Database(file);
