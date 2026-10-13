@@ -27,5 +27,8 @@ export const variables = defineEnvVars({
 	OPENROUTER_APP_TITLE: {
 		description: 'App title sent to OpenRouter as X-Title',
 		schema: (value) => value ?? 'VoiceNotes'
+	},
+	SONIOX_API_KEY: {
+		description: 'Soniox API key (optional — enables the cloud real-time STT engine)'
 	}
 });

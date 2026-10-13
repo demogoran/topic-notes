@@ -30,6 +30,7 @@ Variables are declared in `src/env.ts` (SvelteKit 3 explicit-env, `defineEnvVars
 | `OPENROUTER_API_KEY`   | —                        | **Required** for transcription/categorization |
 | `OPENROUTER_MODEL`     | `xiaomi/mimo-v2.6-flash` | Any OpenRouter model with audio input works   |
 | `OPENROUTER_APP_TITLE` | `VoiceNotes`             | Sent as `X-Title` header to OpenRouter        |
+| `SONIOX_API_KEY`       | —                        | Optional: enables the Soniox cloud real-time STT engine (browser gets short-lived temporary keys via `/api/soniox-temp-key`) |
 | `PORT`                 | `3011`                   | Prod server port (`pnpm start`)               |
 
 `pnpm dev` and `pnpm start` both auto-load `.env` (`pnpm start` uses Node 22's builtin `process.loadEnvFile`).

@@ -4,6 +4,7 @@
 	import { api } from '#lib/client/api';
 	import { Recorder, type RecordingResult } from '#lib/client/recorder';
 	import { LocalStt, STT_ENGINES, type SttEngine, type SttLang } from '#lib/client/localStt';
+	import { SonioxStt } from '#lib/client/sonioxStt';
 	import { formatDuration } from '#lib/client/format';
 	import RecordOrb from '#lib/components/RecordOrb.svelte';
 	import CategoryChip from '#lib/components/CategoryChip.svelte';
@@ -26,7 +27,8 @@
 	let transcript = $state('');
 	let cleanedText = $state('');
 	let proposed = $state<ProposedCategory[]>([]);
-	let selectedIds = $state<number[]>([]);
+	/** Selected category names (case-insensitive). Includes new ones — the API creates them. */
+	let selectedNames = $state<string[]>([]);
 	let newCatName = $state('');
 	let saving = $state(false);
 
@@ -39,25 +41,52 @@
 
 	let recorder: Recorder | null = null;
 
-	// --- local (in-browser) speech recognition ---
+	// --- microphone capture mode ---
+	type MicMode = 'raw' | 'enhanced';
+	const storedMic = (typeof localStorage !== 'undefined'
+		? (localStorage.getItem('mic.mode') as MicMode | null)
+		: null);
+	let micMode = $state<MicMode>(storedMic === 'enhanced' ? 'enhanced' : 'raw');
+
+	function onMicModeChange(e: Event) {
+		micMode = (e.currentTarget as HTMLSelectElement).value as MicMode;
+		try {
+			localStorage.setItem('mic.mode', micMode);
+		} catch {
+			/* private mode — ignore */
+		}
+	}
+
+	// --- speech recognition engine selection ---
 	const stt = new LocalStt();
+	// Key bumped to v2 so the new default applies once instead of being
+	// overridden by engines persisted by earlier versions.
 	const storedEngine = (typeof localStorage !== 'undefined'
-		? (localStorage.getItem('stt.engine') as SttEngine | null)
-		: null) ?? 'parakeet';
-	const initialEngine: SttEngine = STT_ENGINES[storedEngine] ? storedEngine : 'whisper';
-	let engineId = $state<SttEngine>(initialEngine);
+		? (localStorage.getItem('stt.engine.v2') as SttEngineId | null)
+		: null) ?? 'soniox';
+	const initialEngine: SttEngineId =
+		storedEngine === 'soniox' || STT_ENGINES[storedEngine as SttEngine] ? storedEngine : 'soniox';
+	let engineId = $state<SttEngineId>(initialEngine);
 	let modelId = $state(
 		(typeof localStorage !== 'undefined' ? localStorage.getItem('stt.model') : null) ??
-			STT_ENGINES[initialEngine].models[0].value
+			(initialEngine === 'soniox'
+				? STT_ENGINES.whisper.models[0].value
+				: STT_ENGINES[initialEngine as SttEngine].models[0].value)
 	);
 	let sttProgress = $state<{ pct: number; text: string } | null>(null);
-	const modelOptions = $derived(STT_ENGINES[engineId].models);
-	const langSupported = $derived(STT_ENGINES[engineId].supportsLang);
+	const modelOptions = $derived(STT_ENGINES[engineId as SttEngine]?.models ?? []);
+	const langSupported = $derived(STT_ENGINES[engineId as SttEngine]?.supportsLang ?? true);
 
 	// --- live (real-time) transcription ---
 	let liveText = $state('');
 	let segChain: Promise<void> = Promise.resolve();
 	let segBusy = $state(0);
+	let sonioxState = $state('idle');
+
+	/** Engine id: local engines (whisper/parakeet) or the cloud engine (soniox). */
+	type SttEngineId = SttEngine | 'soniox';
+	const soniox = new SonioxStt();
+	const usingSoniox = $derived(engineId === 'soniox');
 
 	const filteredNotes = $derived.by(() => {
 		const q = search.trim().toLowerCase();
@@ -75,6 +104,35 @@
 			return;
 		}
 		if (phase !== 'idle') return;
+
+		if (usingSoniox) {
+			// cloud engine: capture + WebSocket stream, tokens arrive live
+			phase = 'recording';
+			elapsed = 0;
+			liveText = '';
+			sonioxState = 'starting';
+			try {
+				await soniox.start({
+					lang,
+					enhanced: micMode === 'enhanced',
+					onLevel: (v) => (level = v),
+					onTick: (s) => (elapsed = s),
+					onText: (fin, tail) => (liveText = `${fin}${tail}`),
+					onState: (s) => (sonioxState = s),
+					onError: (err) => {
+						level = 0;
+						phase = 'idle';
+						sonioxState = 'error';
+						errorMessage = err.message || 'Speech service error';
+					}
+				});
+			} catch (e) {
+				phase = 'idle';
+				errorMessage = e instanceof Error ? e.message : 'Could not start the speech service';
+			}
+			return;
+		}
+
 		if (!navigator.mediaDevices?.getUserMedia || typeof AudioWorkletNode === 'undefined') {
 			errorMessage = 'Audio recording is not supported in this browser.';
 			return;
@@ -87,7 +145,7 @@
 			phase = 'recording';
 			elapsed = 0;
 			liveText = '';
-			await recorder.start();
+			await recorder.start({ enhanced: micMode === 'enhanced' });
 			beginModelLoad(); // warm up the model while the user speaks
 		} catch (e) {
 			phase = 'idle';
@@ -101,7 +159,7 @@
 		segChain = segChain.then(async () => {
 			try {
 				// load() is a no-op once ready; reuses the in-flight promise otherwise
-				await stt.load(engineId, modelId, (p) => (sttProgress = p));
+				await stt.load(engineId as SttEngine, modelId, (p) => (sttProgress = p));
 				const text = (await stt.transcribe(pcm, lang)).trim();
 				if (text) liveText = liveText ? `${liveText} ${text}` : text;
 			} catch (e) {
@@ -114,10 +172,10 @@
 
 	/** Kicks off model loading in the background (no await) with progress UI. */
 	function beginModelLoad() {
-		if (stt.isReady(engineId, modelId)) return;
+		if (usingSoniox || stt.isReady(engineId as SttEngine, modelId)) return;
 		sttProgress = { pct: 0, text: 'Preparing speech model…' };
 		stt
-			.load(engineId, modelId, (p) => (sttProgress = p))
+			.load(engineId as SttEngine, modelId, (p) => (sttProgress = p))
 			.then(() => (sttProgress = null))
 			.catch((e: unknown) => {
 				sttProgress = null;
@@ -127,18 +185,19 @@
 	}
 
 	async function ensureModelLoaded() {
-		if (stt.isReady(engineId, modelId)) return;
+		if (usingSoniox || stt.isReady(engineId as SttEngine, modelId)) return;
 		phase = 'loading';
 		try {
-			await stt.load(engineId, modelId, (p) => (sttProgress = p));
+			await stt.load(engineId as SttEngine, modelId, (p) => (sttProgress = p));
 		} finally {
 			sttProgress = null;
 		}
 	}
 
 	function onEngineChange(e: Event) {
-		engineId = (e.currentTarget as HTMLSelectElement).value as SttEngine;
-		modelId = STT_ENGINES[engineId].models[0].value;
+		const value = (e.currentTarget as HTMLSelectElement).value as SttEngineId;
+		engineId = value;
+		if (!usingSoniox) modelId = STT_ENGINES[value as SttEngine].models[0].value;
 		persistSttChoice();
 	}
 
@@ -149,7 +208,7 @@
 
 	function persistSttChoice() {
 		try {
-			localStorage.setItem('stt.engine', engineId);
+			localStorage.setItem('stt.engine.v2', engineId);
 			localStorage.setItem('stt.model', modelId);
 		} catch {
 			/* private mode — ignore */
@@ -157,35 +216,59 @@
 	}
 
 	async function stopAndProcess() {
-		if (!recorder) return;
-		let rec: RecordingResult | null = null;
-		try {
-			rec = await recorder.stop(); // emits the final live segment first
-		} catch (e) {
-			// too short / failed — but live text may still exist
-			if (!liveText.trim()) {
+		if (usingSoniox) {
+			if (!soniox.active) return;
+			phase = 'transcribing';
+			try {
+				transcript = await soniox.stop();
+			} catch (e) {
 				phase = 'idle';
-				errorMessage = e instanceof Error ? e.message : 'Recording failed';
+				errorMessage = e instanceof Error ? e.message : 'The speech service failed';
+				return;
+			}
+			sonioxState = 'idle';
+			if (!transcript.trim()) {
+				phase = 'idle';
+				errorMessage = 'Nothing was recognized — try speaking louder or closer to the mic.';
+				return;
+			}
+		} else {
+			if (!recorder) return;
+			let rec: RecordingResult | null = null;
+			try {
+				rec = await recorder.stop(); // emits the final live segment first
+			} catch (e) {
+				// too short / failed — but live text may still exist
+				if (!liveText.trim()) {
+					phase = 'idle';
+					errorMessage = e instanceof Error ? e.message : 'Recording failed';
+					return;
+				}
+			}
+			try {
+				// wait for any in-flight segment transcriptions to finish
+				phase = 'transcribing';
+				await segChain;
+
+				if (liveText.trim()) {
+					transcript = liveText.trim();
+				} else {
+					// no segments were recognized live — transcribe the whole clip
+					if (!rec) throw new Error('Nothing was recorded');
+					await ensureModelLoaded();
+					transcript = await stt.transcribe(rec.pcm, lang);
+				}
+				if (!transcript.trim()) {
+					throw new Error('Nothing was recognized — try speaking louder or closer to the mic.');
+				}
+			} catch (e) {
+				phase = 'idle';
+				errorMessage = e instanceof Error ? e.message : 'Processing failed';
 				return;
 			}
 		}
+
 		try {
-			// wait for any in-flight segment transcriptions to finish
-			phase = 'transcribing';
-			await segChain;
-
-			if (liveText.trim()) {
-				transcript = liveText.trim();
-			} else {
-				// no segments were recognized live — transcribe the whole clip
-				if (!rec) throw new Error('Nothing was recorded');
-				await ensureModelLoaded();
-				transcript = await stt.transcribe(rec.pcm, lang);
-			}
-			if (!transcript.trim()) {
-				throw new Error('Nothing was recognized — try speaking louder or closer to the mic.');
-			}
-
 			phase = 'organizing';
 			const org = await api.post<{
 				text: string;
@@ -196,7 +279,9 @@
 			cleanedText = org.text || transcript;
 			proposed = org.proposed;
 			categories = await refreshCategories();
-			selectedIds = proposed.filter((p) => p.categoryId !== null).map((p) => p.categoryId!);
+			// preselect everything the AI proposed (new labels included — they are
+			// created on save); the user can tap any chip off/on before saving
+			selectedNames = org.proposed.map((p) => p.name);
 			newCatName = '';
 			phase = 'review';
 		} catch (e) {
@@ -205,18 +290,42 @@
 		}
 	}
 
-	function toggleProposal(p: ProposedCategory) {
-		if (p.categoryId === null) {
-			// new category: toggling via text selection is handled at save time
-			return;
-		}
-		selectedIds = selectedIds.includes(p.categoryId)
-			? selectedIds.filter((id) => id !== p.categoryId)
-			: [...selectedIds, p.categoryId];
+	const eqName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+	const isNameSelected = (name: string) => selectedNames.some((n) => eqName(n, name));
+
+	function toggleName(name: string) {
+		selectedNames = isNameSelected(name)
+			? selectedNames.filter((n) => !eqName(n, name))
+			: [...selectedNames, name];
 	}
 
-	const isProposalSelected = (p: ProposedCategory) =>
-		p.categoryId !== null && selectedIds.includes(p.categoryId);
+	function toggleProposal(p: ProposedCategory) {
+		toggleName(p.name);
+	}
+
+	const isProposalSelected = (p: ProposedCategory) => isNameSelected(p.name);
+
+	/** Names typed into the input after pressing Enter become selectable chips. */
+	function commitNewCat(e: KeyboardEvent) {
+		if (e.key !== 'Enter') return;
+		e.preventDefault();
+		const parts = newCatName
+			.split(',')
+			.map((s) => s.trim())
+			.filter(Boolean);
+		for (const p of parts) if (!isNameSelected(p)) selectedNames = [...selectedNames, p];
+		newCatName = '';
+	}
+
+	/** Manually added names that are neither proposals nor existing categories. */
+	const extraNames = $derived(
+		selectedNames.filter(
+			(n) =>
+				!proposed.some((p) => eqName(p.name, n)) &&
+				!categories.some((c) => eqName(c.name, n))
+		)
+	);
 
 	async function saveNote() {
 		if (saving) return;
@@ -224,14 +333,16 @@
 		errorMessage = '';
 		try {
 			// existing selected + any non-empty "new category" text (could be comma-separated)
-			const newNames = newCatName
+			// typed-but-not-committed input is picked up at save as well
+			const pendingNames = newCatName
 				.split(',')
 				.map((s) => s.trim())
 				.filter(Boolean);
-			const names = [
-				...proposed.filter(isProposalSelected).map((p) => p.name),
-				...newNames
-			];
+			// case-insensitive dedupe
+			const names: string[] = [];
+			for (const n of [...selectedNames, ...pendingNames]) {
+				if (n && !names.some((x) => eqName(x, n))) names.push(n);
+			}
 			await api.post('/api/notes', {
 				text: cleanedText || transcript,
 				transcript,
@@ -253,11 +364,13 @@
 	}
 
 	function resetCapture() {
+		if (soniox.active) soniox.cancel();
+		sonioxState = 'idle';
 		phase = 'idle';
 		transcript = '';
 		cleanedText = '';
 		proposed = [];
-		selectedIds = [];
+		selectedNames = [];
 		newCatName = '';
 		level = 0;
 		elapsed = 0;
@@ -322,17 +435,29 @@
 			{/each}
 		</div>
 
-		<!-- speech engine + model -->
+		<!-- speech engine + model + mic -->
 		<div class="stt-config">
+			<select
+				aria-label="Microphone mode"
+				onchange={onMicModeChange}
+				disabled={phase !== 'idle'}
+				title="Raw is usually better for recognition; enable Enhanced if the mic is noisy"
+			>
+				<option value="raw" selected={micMode === 'raw'}>Mic: raw</option>
+				<option value="enhanced" selected={micMode === 'enhanced'}>Mic: enhanced</option>
+			</select>
 			<select aria-label="Speech engine" onchange={onEngineChange} disabled={phase !== 'idle'}>
 				<option value="whisper" selected={engineId === 'whisper'}>Whisper</option>
 				<option value="parakeet" selected={engineId === 'parakeet'}>Parakeet v3 · auto</option>
+				<option value="soniox" selected={engineId === 'soniox'}>Soniox · cloud · live</option>
 			</select>
-			<select aria-label="Speech model" onchange={onModelChange} disabled={phase !== 'idle'}>
-				{#each modelOptions as m (m.value)}
-					<option value={m.value} selected={modelId === m.value}>{m.label}</option>
-				{/each}
-			</select>
+			{#if !usingSoniox}
+				<select aria-label="Speech model" onchange={onModelChange} disabled={phase !== 'idle'}>
+					{#each modelOptions as m (m.value)}
+						<option value={m.value} selected={modelId === m.value}>{m.label}</option>
+					{/each}
+				</select>
+			{/if}
 		</div>
 
 		<!-- orb + timer -->
@@ -363,7 +488,15 @@
 			<!-- live transcript while recording / finishing -->
 			{#if liveText && (phase === 'recording' || phase === 'transcribing')}
 				<div class="live-box">
-					<p class="live-label faint">{segBusy > 0 ? 'transcribing…' : 'live'}</p>
+					<p class="live-label faint">
+						{#if usingSoniox && phase === 'recording' && (sonioxState === 'starting' || sonioxState === 'connecting')}
+							connecting…
+						{:else if segBusy > 0}
+							transcribing…
+						{:else}
+							live
+						{/if}
+					</p>
 					<p class="live-text">{liveText}</p>
 				</div>
 			{/if}
@@ -387,7 +520,7 @@
 						<CategoryChip
 							name={p.name}
 							selected={isProposalSelected(p)}
-							dimmed={p.categoryId !== null && !isProposalSelected(p)}
+							dimmed={!isNameSelected(p.name)}
 							onclick={() => toggleProposal(p)}
 						/>
 					{/each}
@@ -402,19 +535,29 @@
 						{#each categories as c (c.id)}
 							<CategoryChip
 								name={c.name}
-								selected={selectedIds.includes(c.id)}
-								onclick={() =>
-									(selectedIds = selectedIds.includes(c.id)
-										? selectedIds.filter((id) => id !== c.id)
-										: [...selectedIds, c.id])}
+								selected={isNameSelected(c.name)}
+								onclick={() => toggleName(c.name)}
 							/>
 						{/each}
 					</div>
 				{/if}
 
+				{#if extraNames.length > 0}
+					<div class="chips">
+						{#each extraNames as n (n)}
+							<button class="chip extra-chip" onclick={() => toggleName(n)}>{n} ✕</button>
+						{/each}
+					</div>
+				{/if}
+
 				<div class="field newcat">
-					<label class="label" for="new-cat">New category (comma-separated for several)</label>
-					<input id="new-cat" placeholder="e.g. Grocery list" bind:value={newCatName} />
+					<label class="label" for="new-cat">New category (comma-separated, Enter to add)</label>
+					<input
+						id="new-cat"
+						placeholder="e.g. Grocery list"
+						bind:value={newCatName}
+						onkeydown={commitNewCat}
+					/>
 				</div>
 
 				{#if errorMessage}<p class="error-text">{errorMessage}</p>{/if}
@@ -641,6 +784,15 @@
 
 	.newcat {
 		margin-top: 16px;
+	}
+
+	.extra-chip {
+		border-style: dashed;
+	}
+
+	.extra-chip::before {
+		content: '+ ';
+		font-weight: 700;
 	}
 
 	.row {

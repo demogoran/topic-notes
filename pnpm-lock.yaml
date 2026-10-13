@@ -112,6 +112,9 @@ importers:
       '@huggingface/transformers':
         specifier: ^4.3.1
         version: 4.3.1(@types/node@26.6.5)
+      '@soniox/client':
+        specifier: ^2.4.0
+        version: 2.4.0
       '@types/better-sqlite3':
         specifier: ^9.6.0
         version: 9.6.0
@@ -468,6 +471,9 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@soniox/client@2.4.0':
+    resolution: {integrity: sha512-A8HFPiZdw4YRX+LQG9NAmH3NAFfMeBa7T9FdVMpvhccVR6Rrjl2QMxRS70Z4U9ReSggjpv86nkPQbyJHsXMptg==}
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
@@ -1124,6 +1130,8 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@soniox/client@2.4.0': {}
 
   '@standard-schema/spec@1.1.0': {}
 

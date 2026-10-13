@@ -20,7 +20,7 @@ export type RecorderState = 'idle' | 'recording';
 const TARGET_SR = 16000;
 
 // --- live segmentation (VAD) tuning ---
-const SILENCE_MS = 700;
+const SILENCE_MS = 900;
 const MIN_SEG_SAMPLES = TARGET_SR * 0.5;
 const MAX_SEG_SAMPLES = TARGET_SR * 12;
 const PRE_ROLL_SAMPLES = TARGET_SR * 0.35; // context kept between segments
@@ -59,17 +59,29 @@ export class Recorder {
 	onTick: ((elapsedSec: number) => void) | null = null;
 	/** Fired with each detected utterance segment while recording. */
 	onSegment: ((pcm: Float32Array) => void) | null = null;
+	/** Fired with every raw capture frame (16 kHz mono). E.g. used to stream to cloud STT. */
+	onFrame: ((pcm: Float32Array) => void) | null = null;
 
 	get state(): RecorderState {
 		return this.#stream ? 'recording' : 'idle';
 	}
 
-	/** Requests the mic and starts collecting PCM. Throws a friendly Error on failure. */
-	async start(): Promise<void> {
+	/**
+	 * Requests the mic and starts collecting PCM. Throws a friendly Error on failure.
+	 * `enhanced` enables the browser's echo cancellation / noise suppression / AGC.
+	 * It is off by default: those DSP stages frequently distort speech and hurt
+	 * recognition accuracy; raw capture + our own level normalization works better.
+	 */
+	async start(opts?: { enhanced?: boolean }): Promise<void> {
 		if (this.#stream) return;
+		const enhanced = opts?.enhanced ?? false;
 		try {
 			this.#stream = await navigator.mediaDevices.getUserMedia({
-				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+				audio: {
+					echoCancellation: enhanced,
+					noiseSuppression: enhanced,
+					autoGainControl: enhanced
+				}
 			});
 		} catch {
 			throw new Error('Microphone access was denied. Enable it in your browser settings.');
@@ -121,7 +133,9 @@ export class Recorder {
 		}
 		this.#teardown();
 
-		const pcm = rawRate === TARGET_SR ? raw : resample(raw, rawRate, TARGET_SR);
+		const pcm = normalizeForAsr(
+			rawRate === TARGET_SR ? raw : resample(raw, rawRate, TARGET_SR)
+		);
 		if (pcm.length < TARGET_SR * 0.3) throw new Error('Recording was too short');
 		return { pcm, sampleRate: TARGET_SR, durationSec };
 	}
@@ -140,6 +154,7 @@ export class Recorder {
 		// full recording
 		this.#frames.push(frame);
 		this.#samples += frame.length;
+		this.onFrame?.(frame);
 
 		// live segmentation
 		this.#segmentFrame(frame, rms);
@@ -212,7 +227,7 @@ export class Recorder {
 			this.#segHasVoice = false;
 		}
 
-		if (seg.length >= 400) this.onSegment?.(seg);
+		if (seg.length >= 400) this.onSegment?.(normalizeForAsr(seg));
 	}
 
 	#concatSegment(): Float32Array {
@@ -253,6 +268,27 @@ export class Recorder {
 		this.#segHasVoice = false;
 		this.onLevel?.(0);
 	}
+}
+
+/**
+ * Scales a clip up to a healthy peak level for ASR (pure).
+ * Quiet microphones (phone lapel, headset across the room) yield low-amplitude
+ * PCM that both the VAD thresholds and the models struggle with. Amplifying
+ * so the peak reaches ~0.7 recovers most of that; capped so noise is not
+ * blown up beyond usefulness.
+ */
+export function normalizeForAsr(pcm: Float32Array): Float32Array {
+	let peak = 0;
+	for (let i = 0; i < pcm.length; i++) {
+		const a = Math.abs(pcm[i]);
+		if (a > peak) peak = a;
+	}
+	if (peak < 1e-4 || peak > 0.5) return pcm; // silent or already loud
+	const gain = Math.min(0.7 / peak, 8);
+	if (gain <= 1.05) return pcm;
+	const out = new Float32Array(pcm.length);
+	for (let i = 0; i < pcm.length; i++) out[i] = pcm[i] * gain;
+	return out;
 }
 
 /** Naive box-average resampler — sufficient for speech recognition. */
