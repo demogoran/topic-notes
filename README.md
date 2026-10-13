@@ -42,6 +42,17 @@ pnpm build
 pnpm start                # reads PORT / DATABASE_PATH / OPENROUTER_* from env
 ```
 
+### Docker
+
+```bash
+docker compose up -d --build   # http://localhost:3000
+```
+
+- Multi-stage `Dockerfile` (node:22-slim): full-deps build stage → prod-only `node_modules` → lean runtime running as the non-root `node` user.
+- `docker-compose.yml` mounts the `app-data` volume at `/app/data` so the SQLite DB (`/app/data/app.db`) and audio files persist across rebuilds.
+- Secrets come from `.env` via `env_file` (`OPENROUTER_API_KEY`, `AUTH_SECRET`, ...); container paths/`PORT` are forced by the compose `environment` block.
+- Set `ORIGIN` (and `APP_PORT` for the host port) when deploying behind a proxy, e.g. `ORIGIN=https://notes.example.com APP_PORT=8080 docker compose up -d`.
+
 ## Architecture
 
 ```

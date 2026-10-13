@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    image: voice-to-categories:latest
+    restart: unless-stopped
+    ports:
+      # host:container — change the host side (or PORT below) if 3000 is taken
+      - '${APP_PORT:-3000}:3000'
+    environment:
+      PORT: 3000
+      DATABASE_PATH: /app/data/app.db
+      AUDIO_DIR: /app/data/audio
+      # SvelteKit adapter-node needs ORIGIN for correct URLs/csrf;
+      # override with your public URL when deploying behind a proxy.
+      ORIGIN: ${ORIGIN:-http://localhost:3000}
+    env_file:
+      - .env
+    volumes:
+      - app-data:/app/data
+
+volumes:
+  app-data:
