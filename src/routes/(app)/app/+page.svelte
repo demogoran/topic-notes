@@ -80,7 +80,7 @@
     typeof localStorage !== "undefined"
       ? (localStorage.getItem("mic.mode") as MicMode | null)
       : null;
-  let micMode = $state<MicMode>(storedMic === "enhanced" ? "enhanced" : "raw");
+  let micMode = $state<MicMode>(storedMic === "raw" ? "raw" : "enhanced");
 
   function onMicModeChange(e: Event) {
     micMode = (e.currentTarget as HTMLSelectElement).value as MicMode;
