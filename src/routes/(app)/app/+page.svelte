@@ -32,6 +32,7 @@
     | "recording"
     | "loading"
     | "transcribing"
+    | "transcriptEdit"
     | "detecting"
     | "typeSelect"
     | "formatting"
@@ -73,6 +74,12 @@
   let search = $state("");
 
   let recorder: Recorder | null = null;
+
+  /**
+   * Flow generation counter: bumped on reset/close so late-resolving AI
+   * responses from an abandoned flow are ignored.
+   */
+  let gen = 0;
 
   // --- microphone capture mode ---
   type MicMode = "raw" | "enhanced";
@@ -371,7 +378,14 @@
       return;
     }
 
-    // --- explicit AI step 1: pick the best note type ---
+    // Let the user fix recognition mistakes BEFORE any AI call runs
+    phase = "transcriptEdit";
+  }
+
+  /** User confirmed the (possibly edited) transcript → explicit AI step 1. */
+  async function startDetect() {
+    errorMessage = "";
+    const myGen = gen;
     try {
       phase = "detecting";
       const det = await api.post<{
@@ -379,13 +393,14 @@
         reason: string;
         types: NoteTypeInfo[];
       }>("/api/notes/detect-type", { transcript });
+      if (myGen !== gen) return; // user cancelled while the AI was thinking
       aiType = det.type;
       aiReason = det.reason;
       typeInfos = det.types;
       selectedType = det.type;
       phase = "typeSelect";
     } catch (e) {
-      phase = "idle";
+      phase = "transcriptEdit";
       errorMessage = e instanceof Error ? e.message : "Processing failed";
     }
   }
@@ -393,6 +408,7 @@
   /** Explicit AI step 2: type-specific formatting for the user-selected type. */
   async function runFormat() {
     errorMessage = "";
+    const myGen = gen;
     try {
       phase = "formatting";
       const fmt = await api.post<{
@@ -403,6 +419,7 @@
         todos: ProposedTodo[];
       }>("/api/notes/format", { transcript, type: selectedType });
 
+      if (myGen !== gen) return; // user cancelled while the AI was formatting
       fmtText = fmt.text || transcript;
       fmtLanguage = fmt.language;
       proposed = fmt.categories;
@@ -554,6 +571,7 @@
         todos,
       });
       resetCapture();
+      adjustInstruction = "";
       tab = "notes";
       await loadNotes();
     } catch (e) {
@@ -567,7 +585,13 @@
     resetCapture();
   }
 
+  /** Closes the whole capture flow from any step (✕ / Cancel buttons). */
+  function closeCapture() {
+    resetCapture();
+  }
+
   function resetCapture() {
+    gen++; // invalidate in-flight AI calls of this flow
     if (soniox.active) soniox.cancel();
     sonioxState = "idle";
     phase = "idle";
@@ -586,6 +610,33 @@
     elapsed = 0;
     errorMessage = "";
     liveText = "";
+  }
+
+  // --- AI text adjustment (voice-helper alternative to manual editing) ---
+  let adjustInstruction = $state("");
+  let adjusting = $state(false);
+
+  async function adjustWithAi() {
+    if (adjusting || !fmtText.trim()) return;
+    adjusting = true;
+    errorMessage = "";
+    try {
+      const res = await api.post<{ text: string }>("/api/notes/adjust", {
+        text: fmtText,
+        instruction: adjustInstruction || undefined,
+      });
+      fmtText = res.text;
+      adjustInstruction = "";
+    } catch (e) {
+      errorMessage = e instanceof Error ? e.message : "AI adjustment failed";
+    } finally {
+      adjusting = false;
+    }
+  }
+
+  /** Applies an updated note from the NoteCard editor to the local list. */
+  function onNoteUpdated(updated: NoteWithCategories) {
+    notes = notes.map((n) => (n.id === updated.id ? updated : n));
   }
 
   async function refreshCategories(): Promise<Category[]> {
@@ -722,6 +773,8 @@
           {sttProgress?.text ?? "Loading speech model…"}
         {:else if phase === "transcribing"}
           Transcribing…
+        {:else if phase === "transcriptEdit"}
+          Check the text below ↓
         {:else if phase === "detecting"}
           Choosing the note type…
         {:else if phase === "formatting"}
@@ -730,6 +783,9 @@
           Tap to record a note
         {/if}
       </p>
+      {#if phase === "detecting" || phase === "formatting"}
+        <button class="cancel-link faint" onclick={closeCapture}>Cancel</button>
+      {/if}
       {#if sttProgress && (phase === "recording" || phase === "loading")}
         <div class="dl-bar">
           <div class="dl-fill" style:width={`${sttProgress.pct}%`}></div>
@@ -756,9 +812,37 @@
         </p>{/if}
     </div>
 
+    <!-- step 0: fix the transcript right after recording, before any AI call -->
+    {#if phase === "transcriptEdit"}
+      <div class="review card">
+        <button class="close-btn" title="Close" onclick={closeCapture}>✕</button>
+        <p class="label">Check the transcript</p>
+        <p class="ai-reason faint">
+          Recognition isn't perfect — fix any mistakes before the AI runs.
+        </p>
+        <textarea
+          rows="6"
+          bind:value={transcript}
+          aria-label="Transcript to fix"
+        ></textarea>
+        {#if errorMessage}<p class="error-text">{errorMessage}</p>{/if}
+        <div class="row">
+          <button
+            class="btn btn-primary grow"
+            onclick={startDetect}
+            disabled={!transcript.trim()}
+          >
+            Continue
+          </button>
+          <button class="btn btn-ghost" onclick={closeCapture}>Discard</button>
+        </div>
+      </div>
+    {/if}
+
     <!-- step 1 result: type selection (AI proposal highlighted) -->
     {#if phase === "typeSelect"}
       <div class="review card">
+        <button class="close-btn" title="Close" onclick={closeCapture}>✕</button>
         <p class="label">What kind of note is this?</p>
         <p class="ai-reason faint">
           🤖 AI suggests <strong>{aiType}</strong>{#if aiReason}
@@ -790,6 +874,7 @@
     <!-- step 2 result: type-specific review -->
     {#if phase === "review"}
       <div class="review card">
+        <button class="close-btn" title="Close" onclick={closeCapture}>✕</button>
         <p class="label">
           {selectedType === "todo"
             ? "Todolist"
@@ -818,6 +903,24 @@
             placeholder="List title"
           />
         {/if}
+
+        <!-- transcript stays editable; the AI can re-run on the edited text -->
+        <details class="raw">
+          <summary class="faint">Raw transcript (editable)</summary>
+          <textarea
+            class="transcript-edit"
+            rows="4"
+            bind:value={transcript}
+            aria-label="Raw transcript"
+          ></textarea>
+          <button
+            class="btn btn-ghost rerun"
+            disabled={phase !== "review" || !transcript.trim()}
+            onclick={runFormat}
+          >
+            ↻ Re-run AI on edited transcript
+          </button>
+        </details>
 
         {#if selectedType === "todo"}
           <p class="label sect">Tasks</p>
@@ -868,16 +971,18 @@
           <button class="btn btn-ghost add-task" onclick={addTask}
             >+ Add task</button
           >
-        {:else if selectedType !== "text"}
-          <details class="raw">
-            <summary class="faint">Raw transcript</summary>
-            <p class="muted raw-text">{transcript}</p>
-          </details>
         {:else}
-          <details class="raw">
-            <summary class="faint">Raw transcript</summary>
-            <p class="muted raw-text">{transcript}</p>
-          </details>
+          <!-- AI adjust toolbar for text / prompt / summary drafts -->
+          <div class="ai-adjust">
+            <input
+              placeholder="Optional: tell the AI how to adjust (e.g. “make it shorter”, “fix grammar”)…"
+              bind:value={adjustInstruction}
+            />
+            <button class="btn btn-ghost" onclick={adjustWithAi} disabled={adjusting}>
+              {#if adjusting}<span class="spinner"></span>{/if}
+              ✨ Adjust with AI
+            </button>
+          </div>
         {/if}
 
         <p class="label sect">Categories</p>
@@ -1030,6 +1135,7 @@
           <NoteCard
             {note}
             ondelete={deleteNote}
+            onupdated={onNoteUpdated}
             ontoggletodo={toggleTodoItem}
           />
         {/each}
@@ -1170,7 +1276,35 @@
     font-weight: 700;
   }
 
+  .cancel-link {
+    font-size: 13px;
+    text-decoration: underline;
+    padding: 4px 10px;
+  }
+
+  .close-btn {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+    color: var(--text-muted);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .close-btn:hover {
+    background: var(--bg-card-hover);
+    color: var(--text);
+  }
+
   .review {
+    position: relative; /* anchors the close button */
     width: 100%;
     animation: rise 0.35s ease both;
   }
@@ -1274,10 +1408,40 @@
     font-size: 13px;
   }
 
-  .raw-text {
+  /* editable transcript inside the raw details */
+  .transcript-edit {
+    margin-top: 8px;
     font-size: 13px;
-    margin-top: 6px;
-    white-space: pre-wrap;
+    padding: 9px 12px;
+    min-height: 0;
+    resize: vertical;
+  }
+
+  .rerun {
+    margin-top: 8px;
+    font-size: 13px;
+    padding: 8px 12px;
+  }
+
+  /* AI adjust toolbar (text / prompt / summary drafts) */
+  .ai-adjust {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .ai-adjust input {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    padding: 9px 12px;
+  }
+
+  .ai-adjust .btn {
+    font-size: 13px;
+    padding: 9px 12px;
+    flex-shrink: 0;
   }
 
   /* todo draft editor */
@@ -1464,7 +1628,8 @@
     border-radius: var(--radius-pill);
     padding: 6px;
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    z-index: 10;
+    z-index: 30; /* always above the scrolling content container */
+    height: 54px; /* matches the content container's margin-bottom */
   }
 
   .tab {
@@ -1489,11 +1654,6 @@
 
   .tab-ico {
     font-size: 13px;
-  }
-
-  /* leave room for the floating bar */
-  :global(main) {
-    padding-bottom: 96px;
   }
 
   @media (min-width: 700px) {

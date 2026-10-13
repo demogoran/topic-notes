@@ -1,6 +1,8 @@
 import type {
 	Category,
 	CategoryRepo,
+	ChatMsg,
+	ChatRepo,
 	Note,
 	NoteRepo,
 	NoteType,
@@ -239,6 +241,46 @@ export function makeTodoItemRepo(): TodoItemRepo {
 				.get(noteId) as { user_id: number } | undefined;
 			if (!note || note.user_id !== userId) return false;
 			return delItem.run(itemId).changes > 0;
+		}
+	};
+}
+
+// ---------- chat (per-note conversations) ----------
+
+export function makeChatRepo(): ChatRepo {
+	const db = getDb();
+	const insert = db.prepare(
+		'INSERT INTO chat_messages (note_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+	);
+	const clear = db.prepare('DELETE FROM chat_messages WHERE note_id = ?');
+
+	/** Ownership is enforced via a join on notes.user_id. */
+	const forNote = db.prepare(
+		`SELECT m.id, m.role, m.content, m.created_at FROM chat_messages m
+		 JOIN notes n ON n.id = m.note_id
+		 WHERE m.note_id = ? AND n.user_id = ? ORDER BY m.id ASC`
+	);
+
+	return {
+		listForNote(userId: number, noteId: number): ChatMsg[] {
+			return (
+				forNote.all(noteId, userId) as Array<Record<string, unknown>>
+			).map((r) => ({
+				id: r.id as number,
+				role: r.role as 'user' | 'assistant',
+				content: r.content as string,
+				createdAt: r.created_at as number
+			}));
+		},
+		add(userId: number, noteId: number, role: 'user' | 'assistant', content: string): void {
+			const note = db.prepare('SELECT id FROM notes WHERE id = ? AND user_id = ?').get(noteId, userId);
+			if (!note) return;
+			insert.run(noteId, role, content.slice(0, 8000), nowMs());
+		},
+		clear(userId: number, noteId: number): void {
+			const note = db.prepare('SELECT id FROM notes WHERE id = ? AND user_id = ?').get(noteId, userId);
+			if (!note) return;
+			clear.run(noteId);
 		}
 	};
 }

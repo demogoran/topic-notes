@@ -30,13 +30,16 @@
 </div>
 
 <style>
+	/* Fixed-height shell: the content area scrolls inside its own container,
+	   so floating controls (bottom tab bar) always sit outside the content. */
 	.shell {
-		min-height: 100dvh;
+		height: 100dvh;
 		display: flex;
 		flex-direction: column;
 		max-width: 640px;
 		margin: 0 auto;
 		padding: 0 16px;
+		overflow: hidden;
 	}
 
 	.topbar {
@@ -85,7 +88,24 @@
 
 	.content {
 		flex: 1;
-		padding-bottom: 24px;
+		min-height: 0; /* allows the flex child to shrink so overflow kicks in */
+		overflow-y: auto;
+		overflow-x: hidden;
+		/* the container itself ends above the floating bottom tab bar —
+		   content is clipped here and never renders behind the tabs */
+		margin-bottom: calc(78px + var(--safe-bottom));
+		padding-bottom: 16px;
+		scrollbar-width: thin;
+		overscroll-behavior: contain;
+	}
+
+	.content::-webkit-scrollbar {
+		width: 6px;
+	}
+
+	.content::-webkit-scrollbar-thumb {
+		background: var(--line-strong);
+		border-radius: 3px;
 	}
 
 	@media (max-width: 480px) {

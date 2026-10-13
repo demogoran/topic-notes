@@ -84,6 +84,15 @@ function migrate(db: Database.Database): void {
 			PRIMARY KEY (todo_item_id, category_id)
 		);
 		CREATE INDEX IF NOT EXISTS idx_todo_item_categories_cat ON todo_item_categories(category_id);
+
+		CREATE TABLE IF NOT EXISTS chat_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_chat_messages_note ON chat_messages(note_id, id);
 	`);
 
 	// Incremental migration: notes.type for DBs created before note types existed.

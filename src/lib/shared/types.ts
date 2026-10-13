@@ -115,6 +115,12 @@ export interface TodoItemRepo {
 	removeItem(userId: number, noteId: number, itemId: number): boolean;
 }
 
+export interface ChatRepo {
+	listForNote(userId: number, noteId: number): ChatMsg[];
+	add(userId: number, noteId: number, role: 'user' | 'assistant', content: string): void;
+	clear(userId: number, noteId: number): void;
+}
+
 /** Tag ids/names are resolved (and auto-created) server-side. */
 export interface TodoItemInput {
 	text: string;
@@ -138,6 +144,14 @@ export interface ProposedTodo {
 	text: string;
 	done: boolean;
 	tags: string[];
+}
+
+/** A persisted chat message attached to a note (chat mode for text/summary/prompt). */
+export interface ChatMsg {
+	id: number;
+	role: 'user' | 'assistant';
+	content: string;
+	createdAt: number;
 }
 
 /** Result of the explicit "pick the best note type" AI step. */

@@ -51,6 +51,25 @@ export function parseDetectTypeResponse(raw: string): { type: NoteType; reason: 
 	return { type: obj.type, reason };
 }
 
+// ---------- helper: adjust existing text with AI (explicit call) ----------
+
+const ADJUST_SYSTEM = `You are a text-editing assistant inside a voice-notes mobile app.
+You receive a note text (possibly a raw transcript with recognition errors) and an optional short instruction.
+Apply the instruction to the text: fix grammar/punctuation/recognition slips, improve clarity and structure.
+Keep the author's language, voice and meaning. Never answer, comment or add meta-text — return ONLY the adjusted text itself.`;
+
+/** Builds the chat payload for the explicit "adjust my text" call (pure). */
+export function buildAdjustMessages(text: string, instruction?: string): ChatMessage[] {
+	const directive =
+		instruction && instruction.trim()
+			? `The user asks: ${instruction.trim()}`
+			: 'Polish the text: fix slips, punctuation and clarity, keep meaning and length similar.';
+	return [
+		{ role: 'system', content: ADJUST_SYSTEM },
+		{ role: 'user', content: `${directive}\n\nText:\n"""${text}"""` }
+	];
+}
+
 // ---------- step 2: type-specific formatting (explicit call) ----------
 
 const FORMAT_COMMON = `You receive a raw speech-to-text transcript (English or Ukrainian, possibly with recognition errors).

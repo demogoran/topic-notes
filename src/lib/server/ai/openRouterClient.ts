@@ -14,7 +14,11 @@ import type { DetectedType, FormatResult, NoteType } from '#lib/shared/types';
 
 interface ChatCompletionResponse {
 	choices?: Array<{ message?: { content?: string | null } }>;
-	error?: { message?: string };
+	error?: { message: string };
+}
+
+interface StreamChunk {
+	choices?: Array<{ delta?: { content?: string | null } }>;
 }
 
 interface TranscribeOptions {
@@ -88,7 +92,73 @@ export class OpenRouterClient {
 		return raw.trim();
 	}
 
-	private async chat(messages: ChatMessage[]): Promise<string> {
+	/**
+	 * Streaming chat for the realtime note-chat mode. Returns an async generator
+	 * of plain text deltas (SSE frames from the provider are parsed server-side).
+	 */
+	async chatStream(messages: ChatMessage[]): Promise<AsyncGenerator<string>> {
+		if (this.apiKey.length === 0) {
+			throw error(503, 'AI service is not configured: set OPENROUTER_API_KEY in .env');
+		}
+		let res: Response;
+		try {
+			res = await fetch(`${this.baseUrl}/chat/completions`, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${this.apiKey}`,
+					'Content-Type': 'application/json',
+					'HTTP-Referer': 'https://voicenotes.local',
+					'X-Title': this.appTitle
+				},
+				body: JSON.stringify({
+					model: this.model,
+					messages,
+					temperature: 0.4,
+					max_tokens: 2048,
+					stream: true
+				})
+			});
+		} catch {
+			throw error(502, 'Could not reach the AI service');
+		}
+		if (!res.ok || !res.body) {
+			const detail = await res.text().catch(() => '');
+			throw error(502, `AI request failed (${res.status})${detail.slice(0, 200)}`);
+		}
+
+		const reader = res.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+
+		return (async function* () {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				// SSE frames are separated by a blank line
+				const frames = buffer.split('\n\n');
+				buffer = frames.pop() ?? '';
+				for (const frame of frames) {
+					for (const line of frame.split('\n')) {
+						const trimmed = line.trim();
+						if (!trimmed.startsWith('data:')) continue;
+						const payload = trimmed.slice(5).trim();
+						if (!payload || payload === '[DONE]') continue;
+						try {
+							const chunk = JSON.parse(payload) as StreamChunk;
+							const delta = chunk.choices?.[0]?.delta?.content;
+							if (delta) yield delta;
+						} catch {
+							// ignore malformed keep-alive/comment frames
+						}
+					}
+				}
+			}
+		})();
+	}
+
+	/** Non-streaming chat completion (exposed for simple one-shot helpers). */
+	async chat(messages: ChatMessage[]): Promise<string> {
 		if (this.apiKey.length === 0) {
 			throw error(503, 'AI service is not configured: set OPENROUTER_API_KEY in .env');
 		}
