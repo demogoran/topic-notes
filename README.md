@@ -20,15 +20,19 @@ pnpm dev               # dev server at http://localhost:5173
 
 ### Environment
 
+Variables are declared in `src/env.ts` (SvelteKit 3 explicit-env, `defineEnvVars`) and read serverside from `$app/env/private`:
+
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_PATH` | `./data/app.db` | SQLite file location (created on first run) |
+| `AUDIO_DIR` | `./data/audio` | Stored recordings |
 | `SESSION_TTL_DAYS` | `30` | Session cookie lifetime |
 | `OPENROUTER_API_KEY` | — | **Required** for transcription/categorization |
 | `OPENROUTER_MODEL` | `xiaomi/mimo-v2.6-flash` | Any OpenRouter model with audio input works |
 | `OPENROUTER_APP_TITLE` | `VoiceNotes` | Sent as `X-Title` header to OpenRouter |
 | `PORT` | `3000` | Prod server port (`pnpm start`) |
 
+`pnpm dev` and `pnpm start` both auto-load `.env` (`pnpm start` uses Node 22's builtin `process.loadEnvFile`).
 > **Note:** microphone capture requires a secure context — `localhost` works in dev; for LAN/phone testing use HTTPS (e.g. `npx localtunnel` or a reverse proxy) or Chrome's `unsafely-treat-insecure-origin-as-secure` flag.
 
 ## Production
