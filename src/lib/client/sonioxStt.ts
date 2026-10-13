@@ -53,7 +53,7 @@ class RecorderSource implements AudioSource {
 	constructor(
 		private readonly recorder: Recorder,
 		private readonly enhanced: boolean
-	) {}
+	) { }
 
 	async start(handlers: AudioSourceHandlers): Promise<void> {
 		this.recorder.onFrame = (pcm) => handlers.onData(float32ToInt16Le(pcm));
@@ -121,9 +121,10 @@ export class SonioxStt {
 		const recording = client.realtime.record({
 			model: SONIOX_MODEL,
 			audio_format: 'pcm_s16le',
-			sample_rate: 16000,
+			sample_rate: 24000,
 			num_channels: 1,
 			language_hints: hints,
+			language_hints_strict: true,
 			auto_reconnect: true,
 			max_reconnect_attempts: 3,
 			source: new RecorderSource(recorder, opts.enhanced)
