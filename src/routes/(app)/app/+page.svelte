@@ -57,7 +57,7 @@
 	// --- live (real-time) transcription ---
 	let liveText = $state('');
 	let segChain: Promise<void> = Promise.resolve();
-	let segBusy = 0;
+	let segBusy = $state(0);
 
 	const filteredNotes = $derived.by(() => {
 		const q = search.trim().toLowerCase();

@@ -10,11 +10,14 @@ services:
       PORT: 3000
       DATABASE_PATH: /app/data/app.db
       AUDIO_DIR: /app/data/audio
-      # SvelteKit adapter-node needs ORIGIN for correct URLs/csrf;
-      # override with your public URL when deploying behind a proxy.
-      ORIGIN: ${ORIGIN:-http://localhost:3000}
+      # SvelteKit adapter-node needs ORIGIN for correct URLs/csrf.
+      # Precedence: ORIGIN → Coolify's FQDN → http://localhost:3000
+      ORIGIN: ${ORIGIN:-${COOLIFY_FQDN:-http://localhost:3000}}
     env_file:
-      - .env
+      # .env is gitignored and usually absent on the deploy server (e.g. Coolify);
+      # secrets should be set as environment variables in the platform UI instead.
+      - path: .env
+        required: false
     volumes:
       - app-data:/app/data
 
